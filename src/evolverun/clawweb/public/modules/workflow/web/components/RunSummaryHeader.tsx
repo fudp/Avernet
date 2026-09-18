@@ -134,7 +134,7 @@ export default function RunSummaryHeader({ run, nodeCount, succeededCount, faile
               🩹 修复
             </button>
           )}
-          {pendingApprovalCount > 0 && onApproval && (
+          {run.status === 'waiting' && pendingApprovalCount > 0 && onApproval && (
             <button
               type="button"
               onClick={onApproval}
