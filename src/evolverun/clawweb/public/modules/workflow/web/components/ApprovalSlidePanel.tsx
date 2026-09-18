@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback } from 'react'
 import StatusBadge from './StatusBadge'
-import { formatDuration } from '@avernet/workflow/web/utils/time'
+import { formatTime, formatDuration } from '@avernet/workflow/web/utils/time'
 import { approvalDisplay, type ApprovalDisplay } from '../../shared/approval-display'
+import { getClientUser } from '@avernet/clawweb-shared/web/hooks/useClientUser'
 import type { FlowRun } from '@avernet/clawweb-shared/web/types'
 import type { ApprovalCardSummary } from '@avernet/clawweb-shared/web/api/client'
 
@@ -80,8 +81,11 @@ type ResolveResult = {
 
 // ── API helpers ────────────────────────────────────────────────────────
 
-async function fetchApproval(id: number): Promise<ApprovalData> {
-  const res = await fetch(`/api/approval/${id}`)
+async function fetchApproval(id: number, empId?: string): Promise<ApprovalData> {
+  const url = empId
+    ? `/api/approval/${id}?empId=${encodeURIComponent(empId)}`
+    : `/api/approval/${id}`
+  const res = await fetch(url)
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
     throw new Error(body.message || `HTTP ${res.status}`)
@@ -92,13 +96,14 @@ async function fetchApproval(id: number): Promise<ApprovalData> {
 async function resolveApproval(
   id: number,
   action: 'approve' | 'reject',
+  empId: string,
   comment?: string,
   detail?: Record<string, unknown>,
 ): Promise<ResolveResult> {
   const res = await fetch(`/api/approval/${id}/resolve`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action, comment, detail }),
+    body: JSON.stringify({ empId, action, comment, detail }),
   })
   return res.json()
 }
@@ -179,12 +184,15 @@ export default function ApprovalSlidePanel({ card, run, onClose, onResolved }: A
 
   const isSectionMode = !!data?.sections && data.sections.length > 0
 
+  // Resolve current user's empId from clawweb auth context
+  const empId = getClientUser()?.userId ?? ''
+
   // Load approval detail
   useEffect(() => {
     let cancelled = false
     setLoading(true)
     setError(null)
-    fetchApproval(card.id)
+    fetchApproval(card.id, empId || undefined)
       .then((d) => {
         if (cancelled) return
         setData(d)
@@ -215,19 +223,19 @@ export default function ApprovalSlidePanel({ card, run, onClose, onResolved }: A
         setLoading(false)
       })
     return () => { cancelled = true }
-  }, [card.id])
+  }, [card.id, empId])
 
   // Poll for status updates when pending
   useEffect(() => {
     if (!data || data.status !== 'pending') return
     const timer = setInterval(async () => {
       try {
-        const fresh = await fetchApproval(card.id)
+        const fresh = await fetchApproval(card.id, empId || undefined)
         setData(fresh)
       } catch { /* ignore poll errors */ }
     }, 5000)
     return () => clearInterval(timer)
-  }, [card.id, data?.status])
+  }, [card.id, data?.status, empId])
 
   // Close on Escape
   useEffect(() => {
@@ -240,6 +248,11 @@ export default function ApprovalSlidePanel({ card, run, onClose, onResolved }: A
     async (action: 'approve' | 'reject') => {
       if (!data) return
 
+      if (!empId) {
+        setResult({ error: '无法获取用户身份，请先登录' })
+        return
+      }
+
       if (isSectionMode && data.sections) {
         const err = validateSections(data.sections, sectionSelection)
         if (err) { setValidationError(err); return }
@@ -251,10 +264,10 @@ export default function ApprovalSlidePanel({ card, run, onClose, onResolved }: A
         const detail = isSectionMode && data.sections
           ? buildDetailPayload(data.sections, sectionSelection)
           : undefined
-        const res = await resolveApproval(card.id, action, comment || undefined, detail)
+        const res = await resolveApproval(card.id, action, empId, comment || undefined, detail)
         setResult(res)
         if (res.ok) {
-          const fresh = await fetchApproval(card.id)
+          const fresh = await fetchApproval(card.id, empId)
           setData(fresh)
           onResolved?.()
         }
@@ -264,7 +277,7 @@ export default function ApprovalSlidePanel({ card, run, onClose, onResolved }: A
         setActionLoading(false)
       }
     },
-    [card.id, data, comment, isSectionMode, sectionSelection, onResolved],
+    [card.id, data, comment, isSectionMode, sectionSelection, onResolved, empId],
   )
 
   const copy = data ? approvalDisplay(data.approvalType, data.display) : null
@@ -635,13 +648,4 @@ function SectionCard({ section, selection, setSelection, disabled }: {
       </div>
     </div>
   )
-}
-
-// ── Utils ──────────────────────────────────────────────────────────────
-
-function formatTime(ts: number | null): string {
-  if (!ts) return '—'
-  const ms = ts > 1e12 ? ts : ts * 1000
-  const d = new Date(ms)
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }

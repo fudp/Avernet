@@ -57,7 +57,7 @@ export default function RunDetail() {
   const approvalsQuery = useFlowApprovals(flowId ?? '')
   const approvalCards = approvalsQuery.data?.items ?? []
   const pendingApprovals = approvalCards.filter((c) => c.status === 'pending')
-  const approvalNodeIds = useMemo(() => new Set(approvalCards.map((c) => c.nodeId)), [approvalCards])
+  const pendingApprovalNodeIds = useMemo(() => new Set(pendingApprovals.map((c) => c.nodeId)), [pendingApprovals])
 
   const {
     data: runDetail,
@@ -274,10 +274,10 @@ export default function RunDetail() {
                   workflowSpec={workflowQuery.data}
                   onAnalyze={handleAnalyze}
                   onApproval={(node) => {
-                    const card = approvalCards.find((c) => c.nodeId === node.node_id)
+                    const card = pendingApprovals.find((c) => c.nodeId === node.node_id)
                     if (card) setApprovalCard(card)
                   }}
-                  approvalNodeIds={approvalNodeIds}
+                  approvalNodeIds={pendingApprovalNodeIds}
                 />
               </div>
             )}
