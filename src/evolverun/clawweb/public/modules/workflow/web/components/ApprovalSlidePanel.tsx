@@ -611,6 +611,12 @@ function SectionCard({ section, selection, setSelection, disabled }: {
                   )}
                 </div>
               )}
+              {isInteractive && field.expected && !field.actual && (
+                <div className="mb-2 rounded-md bg-slate-50 px-3 py-2 text-sm text-slate-600 leading-relaxed whitespace-pre-wrap break-words">
+                  {field.expectedLabel && <div className="text-xs text-slate-400 mb-1">{field.expectedLabel}</div>}
+                  {field.expected}
+                </div>
+              )}
               {isInteractive && field.actions?.map((action) => {
                 const isActive = sel?.action === action.key
                 return (
