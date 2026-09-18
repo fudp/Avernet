@@ -2,8 +2,10 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAnalyzeRun, useAnalysisProgress, useFlowRuns, useWorkflowHealth } from '../../api/hooks'
 import { useDeleteFlowRun, useRerunFlowRun } from '@avernet/clawweb-shared/web/api/hooks'
+import { useFlowApprovals } from '@avernet/clawweb-shared/web/api/hooks'
 import AnalyzeRunBotModal from '../AnalyzeRunBotModal'
 import AutoHealPanel from '../AutoHealPanel'
+import ApprovalSlidePanel from '../ApprovalSlidePanel'
 import { SuccessTrendCard } from '../SuccessTrendCard'
 import { RunCountTrendCard } from '../RunCountTrendCard'
 import { NodeAnalysisPanel } from '../NodeAnalysisPanel'
@@ -12,6 +14,7 @@ import EmptyState from '../EmptyState'
 import ErrorState from '../ErrorState'
 import { formatTimeShort, formatDuration } from '../../utils/time'
 import type { FlowRun, WorkflowTypeRow } from '@avernet/clawweb-shared/web/types'
+import type { ApprovalCardSummary } from '@avernet/clawweb-shared/web/api/client'
 import TimeRangeFilter, { toTimeRange } from '../TimeRangeFilter'
 
 function TrendTabs({
@@ -77,7 +80,7 @@ function MetricCell({
   )
 }
 
-function RunRow({ run, onAnalyze, onAutoHeal, dispatching, busy, onAnalysisFinished }: { run: FlowRun; onAnalyze: (run: FlowRun) => void; onAutoHeal: (run: FlowRun) => void; dispatching: boolean; busy: boolean; onAnalysisFinished: () => unknown }) {
+function RunRow({ run, onAnalyze, onAutoHeal, onApproval, dispatching, busy, onAnalysisFinished }: { run: FlowRun; onAnalyze: (run: FlowRun) => void; onAutoHeal: (run: FlowRun) => void; onApproval: (run: FlowRun) => void; dispatching: boolean; busy: boolean; onAnalysisFinished: () => unknown }) {
   const navigate = useNavigate()
   const status = run.evolution_analysis_status ?? null
   const progressQuery = useAnalysisProgress(run.flow_id, status === 'analyzing')
@@ -121,6 +124,11 @@ function RunRow({ run, onAnalyze, onAutoHeal, dispatching, busy, onAnalysisFinis
     e.stopPropagation()
     onAutoHeal(run)
   }, [onAutoHeal, run])
+
+  const handleApproval = useCallback((e: React.MouseEvent) => {
+    e.stopPropagation()
+    onApproval(run)
+  }, [onApproval, run])
 
   const handleAnalyze = useCallback((e: React.MouseEvent) => {
     e.stopPropagation()
@@ -208,6 +216,17 @@ function RunRow({ run, onAnalyze, onAutoHeal, dispatching, busy, onAnalysisFinis
               🩹
             </button>
           )}
+          {/* 审批 */}
+          {run.status === 'waiting' && (
+            <button
+              type="button"
+              onClick={handleApproval}
+              className="rounded border border-amber-300 bg-amber-50 px-1.5 py-1 text-xs font-medium text-amber-700 hover:border-amber-400 hover:bg-amber-100"
+              title="审批"
+            >
+              📋
+            </button>
+          )}
           {/* 删除 */}
           {confirming ? (
             <span className="inline-flex items-center gap-1">
@@ -284,6 +303,8 @@ function OverviewContent({ workflow }: OverviewTabProps) {
   const timeParams = useMemo(() => toTimeRange(timeRange), [timeRange])
   const [analyzeRun, setAnalyzeRun] = useState<FlowRun | null>(null)
   const [autoHealRun, setAutoHealRun] = useState<FlowRun | null>(null)
+  const [approvalRun, setApprovalRun] = useState<FlowRun | null>(null)
+  const [approvalCard, setApprovalCard] = useState<ApprovalCardSummary | null>(null)
   const analyzeMutation = useAnalyzeRun()
   const dispatchError = analyzeMutation.isError
     ? analyzeMutation.error instanceof Error ? analyzeMutation.error.message : String(analyzeMutation.error)
@@ -344,6 +365,10 @@ function OverviewContent({ workflow }: OverviewTabProps) {
 
   const runs = useMemo(() => data?.runs ?? [], [data?.runs])
   const totalCount = data?.total ?? 0
+
+  // Fetch approval cards for the selected run when approval panel is opened
+  const approvalsQuery = useFlowApprovals(approvalRun?.flow_id ?? '', !!approvalRun)
+  const pendingApprovals = (approvalsQuery.data?.items ?? []).filter((c) => c.status === 'pending')
 
   const stats = useMemo(() => {
     const counts = metricsData?.statusCounts ?? {}
@@ -406,6 +431,14 @@ function OverviewContent({ workflow }: OverviewTabProps) {
           run={autoHealRun}
           onClose={() => setAutoHealRun(null)}
           onRerunComplete={() => void refetch()}
+        />
+      )}
+      {approvalRun && pendingApprovals.length > 0 && (
+        <ApprovalSlidePanel
+          card={pendingApprovals[0]}
+          run={approvalRun}
+          onClose={() => { setApprovalRun(null); setApprovalCard(null) }}
+          onResolved={() => void approvalsQuery.refetch()}
         />
       )}
       <div className="flex items-center justify-end gap-1" aria-label="概览时间范围">
@@ -578,7 +611,8 @@ function OverviewContent({ workflow }: OverviewTabProps) {
                     onAnalysisFinished={refetch}
                     dispatching={analyzeMutation.isPending && analyzeMutation.variables?.flowId === run.flow_id}
                     onAnalyze={(selected) => { if (!analyzeMutation.isPending) { analyzeMutation.reset(); setAnalyzeRun(selected) } }}
-                    onAutoHeal={(selected) => setAutoHealRun(selected)} />
+                    onAutoHeal={(selected) => setAutoHealRun(selected)}
+                    onApproval={(selected) => { setApprovalRun(selected); setApprovalCard(null) }} />
                 ))}
               </tbody>
             </table>
