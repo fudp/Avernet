@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAnalyzeRun, useAnalysisProgress, useFlowRuns, useWorkflowHealth } from '../../api/hooks'
-import { useDeleteFlowRun, useRerunFlowRun } from '@avernet/clawweb-shared/web/api/hooks'
-import { useFlowApprovals } from '@avernet/clawweb-shared/web/api/hooks'
+import { useDeleteFlowRun, useRerunFlowRun, useFlowApprovals } from '@avernet/clawweb-shared/web/api/hooks'
 import AnalyzeRunBotModal from '../AnalyzeRunBotModal'
 import AutoHealPanel from '../AutoHealPanel'
 import ApprovalSlidePanel from '../ApprovalSlidePanel'
@@ -14,7 +13,6 @@ import EmptyState from '../EmptyState'
 import ErrorState from '../ErrorState'
 import { formatTimeShort, formatDuration } from '../../utils/time'
 import type { FlowRun, WorkflowTypeRow } from '@avernet/clawweb-shared/web/types'
-import type { ApprovalCardSummary } from '@avernet/clawweb-shared/web/api/client'
 import TimeRangeFilter, { toTimeRange } from '../TimeRangeFilter'
 
 function TrendTabs({
@@ -304,7 +302,6 @@ function OverviewContent({ workflow }: OverviewTabProps) {
   const [analyzeRun, setAnalyzeRun] = useState<FlowRun | null>(null)
   const [autoHealRun, setAutoHealRun] = useState<FlowRun | null>(null)
   const [approvalRun, setApprovalRun] = useState<FlowRun | null>(null)
-  const [approvalCard, setApprovalCard] = useState<ApprovalCardSummary | null>(null)
   const analyzeMutation = useAnalyzeRun()
   const dispatchError = analyzeMutation.isError
     ? analyzeMutation.error instanceof Error ? analyzeMutation.error.message : String(analyzeMutation.error)
@@ -369,6 +366,8 @@ function OverviewContent({ workflow }: OverviewTabProps) {
   // Fetch approval cards for the selected run when approval panel is opened
   const approvalsQuery = useFlowApprovals(approvalRun?.flow_id ?? '', !!approvalRun)
   const pendingApprovals = (approvalsQuery.data?.items ?? []).filter((c) => c.status === 'pending')
+  const approvalsLoading = approvalRun && approvalsQuery.isLoading
+  const noPendingApprovals = approvalRun && !approvalsQuery.isLoading && pendingApprovals.length === 0
 
   const stats = useMemo(() => {
     const counts = metricsData?.statusCounts ?? {}
@@ -437,9 +436,37 @@ function OverviewContent({ workflow }: OverviewTabProps) {
         <ApprovalSlidePanel
           card={pendingApprovals[0]}
           run={approvalRun}
-          onClose={() => { setApprovalRun(null); setApprovalCard(null) }}
+          onClose={() => setApprovalRun(null)}
           onResolved={() => void approvalsQuery.refetch()}
         />
+      )}
+      {approvalsLoading && (
+        <div className="fixed inset-0 z-50 flex justify-end bg-black/40" onClick={() => setApprovalRun(null)}>
+          <div className="flex h-full w-full max-w-2xl flex-col items-center justify-center bg-white shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            <div className="h-8 w-8 animate-spin rounded-full border-2 border-gray-300 border-t-blue-600" />
+            <p className="mt-3 text-sm text-gray-500">加载审批信息...</p>
+          </div>
+        </div>
+      )}
+      {noPendingApprovals && (
+        <div className="fixed inset-0 z-50 flex justify-end bg-black/40" onClick={() => setApprovalRun(null)}>
+          <div className="flex h-full w-full max-w-2xl flex-col bg-white shadow-2xl" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between border-b border-gray-200 bg-gradient-to-r from-amber-500 to-orange-500 px-6 py-4">
+              <div className="flex items-center gap-2">
+                <span className="text-lg">📋</span>
+                <h2 className="font-bold text-white text-lg">审批</h2>
+              </div>
+              <button onClick={() => setApprovalRun(null)} className="rounded-md p-1.5 text-white/70 transition-colors hover:bg-white/10 hover:text-white" title="关闭">
+                <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+            <div className="flex flex-1 items-center justify-center">
+              <p className="text-sm text-gray-500">该运行没有待处理的审批</p>
+            </div>
+          </div>
+        </div>
       )}
       <div className="flex items-center justify-end gap-1" aria-label="概览时间范围">
         {([1, 'yesterday', 7, 30] as const).map((value) => (
@@ -612,7 +639,7 @@ function OverviewContent({ workflow }: OverviewTabProps) {
                     dispatching={analyzeMutation.isPending && analyzeMutation.variables?.flowId === run.flow_id}
                     onAnalyze={(selected) => { if (!analyzeMutation.isPending) { analyzeMutation.reset(); setAnalyzeRun(selected) } }}
                     onAutoHeal={(selected) => setAutoHealRun(selected)}
-                    onApproval={(selected) => { setApprovalRun(selected); setApprovalCard(null) }} />
+                    onApproval={(selected) => setApprovalRun(selected)} />
                 ))}
               </tbody>
             </table>
