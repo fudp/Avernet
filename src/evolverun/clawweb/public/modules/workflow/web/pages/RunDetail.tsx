@@ -15,6 +15,7 @@ import type { RunEvolutionAnalysisResponse, WorkflowAnalysisProgressResponse } f
 import type { FlowRun, NodeExecution } from '@avernet/clawweb-shared/web/types'
 import RunArchivePanel from '../components/RunArchivePanel'
 import AutoHealPanel from '../components/AutoHealPanel'
+import ApprovalPanel from '../components/ApprovalPanel'
 
 type TabId = 'nodes' | 'logs' | 'dag' | 'archive'
 
@@ -191,6 +192,10 @@ export default function RunDetail() {
               runStatus={run.status}
               nodes={nodes}
             />
+          </div>
+
+          <div className="mt-4">
+            <ApprovalPanel flowId={flowId ?? ''} />
           </div>
 
           <div className="mt-4">
