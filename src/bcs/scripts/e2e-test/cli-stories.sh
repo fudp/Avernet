@@ -175,6 +175,16 @@ runtime:
         return
     fi
 
+    # Pending-input reads authorize the Human, independently of the Bot token
+    # used to start a one-shot Run. Join the operator to the trial session.
+    _cli_story_run "operator joins the trial session as a Human" PM \
+        session add-member "$trial_session_id" \
+        --bot-uuid "human_${BCS_MOCK_USER_ID}" --role consultant || {
+        api_delete "/groups/${trial_group_id}?bot_id=${BOT_PM_UUID}"
+        rm -f "$yaml_file"
+        return
+    }
+
     _cli_story_run "operator checks current-session state-machine permission" PM \
         collaborate permission --session "$trial_session_id" || {
         api_delete "/groups/${trial_group_id}?bot_id=${BOT_PM_UUID}"
@@ -201,6 +211,20 @@ runtime:
         api_delete "/groups/${trial_group_id}?bot_id=${BOT_PM_UUID}"
         rm -f "$yaml_file"
         return
+    fi
+
+    _cli_story_run "operator queries the exact one-shot execution graph" PM \
+        collaborate query --run "$run_id" --graph || return
+    assert_json_eq "CLI graph keeps the Run identity" "$BCS_CLI_STDOUT" "run.run_id" "$run_id"
+    _cli_story_run "operator checks pending Human input through CLI" PM \
+        collaborate query --run "$run_id" --pending || return
+    assert_eq "Bot-only workflow exposes no Human response target" "$BCS_CLI_STDOUT" "[]"
+    # Exercise the reply guard against a real Bot-only Run; it must never POST
+    # a Human response to a node absent from the authorized pending list.
+    if bcs_cli_json PM collaborate respond --run "$run_id" --node plan --content "invalid Human reply"; then
+        assert_eq "CLI refuses a non-pending Human node" "accepted" "rejected"
+    else
+        assert_contains "CLI explains that the node is not pending" "$BCS_CLI_STDERR" "not pending"
     fi
 
     _cli_story_run "operator reloads current-session history after the one-shot run" PM \
@@ -310,12 +334,12 @@ for item in items:
     _cli_story_run "operator reads the expanded group" PM get-group --id "$group_id" || return
     assert_contains "CLI group read contains the added specialist" "$BCS_CLI_STDOUT" "$BOT_QA_UUID"
 
-    _cli_story_run "operator lists groups containing itself" PM list-groups || return
+    _cli_story_run "operator lists groups containing itself" PM list-groups --batch-size 20 || return
     local cli_group_count api_group_count
     cli_group_count=$(printf '%s' "$BCS_CLI_STDOUT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["returned"])' 2>/dev/null)
     assert_not_empty "CLI current-bot group list exposes its result count" "$cli_group_count"
     assert_contains "CLI current-bot group list contains the managed group" "$BCS_CLI_STDOUT" "$group_id"
-    api_get "/bots/${BOT_PM_UUID}/groups?include_session_groups=false"
+    api_get "/bots/${BOT_PM_UUID}/groups?include_session_groups=false&offset=0&limit=20"
     require_status "CLI group list can be checked against the formal bot-group API" "200" || return
     assert_contains "bot-group read-back contains the CLI-managed group" "$RESPONSE" "$group_id"
     api_group_count=$(printf '%s' "$RESPONSE" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d.get("items", [])))' 2>/dev/null)

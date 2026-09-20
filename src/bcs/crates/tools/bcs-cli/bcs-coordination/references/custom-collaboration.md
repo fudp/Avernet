@@ -16,7 +16,8 @@
 - YAML 中只声明逻辑 participant binding，不写真实 Bot UUID。运行或创建群时，再通过 CLI 参数把逻辑角色绑定到当前 session 或发现结果中的 Bot。
 - 不根据 YAML 外观猜测有效性。设计交付或建群前必须通过 `bcs-cli collaboration validate`；当前 session 一次性运行由 `bcs collaborate run` 的服务端接口执行同一套 authoring 和运行时校验。
 - 服务端固定拒绝当前运行时尚未实现的 `guard`、`action`、`output_contract`、`variables`、`events` 和 `input_schema`。`judge` 仅在当前 BCS 实例配置了 LLM provider 时可用。
-- 当前运行时要求无环图、唯一零入度入口、唯一 `final_output` 出口，且所有节点从入口可达并能到达最终出口。这些限制始终生效，不由 CLI 参数切换。
+- 普通流程使用 v1 无环图；Loop 使用 v2 hierarchical，由服务端展开为无环执行图。外层图仍要求唯一零入度入口、唯一 `final_output` 出口，且所有节点从入口可达并能到达最终出口。
+- v2 可以在同一外层图中放置多个 Loop，各自维护执行次数和上一结果，通过外层 `transitions` 连接；不支持嵌套 Loop 或直接跳入另一个 Loop 的 body。具体字段及 outcome/target 区别见 [Fixed Loop](custom-collaboration-schema.md#fixed-loop)。
 
 ## 选择执行方式
 
@@ -148,9 +149,36 @@ HTTP 请求若同时带非空 `event_subscriptions` 和 `create_initial_session=
 ## 编写约束
 
 - 顶层只允许 `name`、可选 `metadata`、`participants` 和 `runtime`。
-- 保留 `runtime.kind: state_machine` 和 `runtime.state_machine.version: 1`。
+- 保留 `runtime.kind: state_machine`。普通 DAG 使用 `version: 1`；固定 Loop 的 `version: 2` 需按 schema 校验，执行默认关闭，需服务端显式开启 `collaboration.experimental_fixed_loop_execution`；关闭时 preview 返回 `VALIDATION_ONLY_FEATURE`。
 - 不输出顶层 `api_version`、`id` 或 `version`；这些字段由 BCS 创建群时提供。
 - 不把真实 Bot UUID、token、私密地址或运行时 participant role 写进 YAML。
 - 真实 Bot UUID 只放在 `collaborate run --binding` 或 `collaboration create --binding` 参数中，不写入 YAML。
 - 用户可见交付必须包含完整 YAML，不能用临时文件路径、工具输出或“见上文”代替。
 - 执行节点只输出自己的业务产物；不要要求每个节点重复传递完整参数对象。
+
+
+## 查看 Run、Loop 轮次与人工回复
+
+JSON 是默认输出；加 `--no-json` 查看轮次、逻辑节点、attempt、路由和上一轮结果：
+
+```bash
+bcs-cli --no-json collaborate query --run "$run_id"
+bcs-cli --no-json collaborate query --run "$run_id" --graph
+bcs-cli --no-json collaborate query --run "$run_id" --pending
+bcs-cli --no-json collaborate query --run "$run_id" --node "$execution_node_id"
+```
+
+`--node`、`--graph`、`--pending` 互斥。不带选项查询 Run。节点 ID 必须复制自该 Run 的返回值，
+不能把 logical node 或 preview ID 当成 execution ID，更不能手工拼接 `ln-...`。
+iteration 从 1 开始，retry attempt 从 0 开始；相同 logical node 的不同 iteration 是不同节点。
+Graph 的 break/exhausted 说明不表示已经选路，实际选择以 source Node 的 outcome 为准。
+
+人工用户使用现有认证/网关身份查询 `--pending`，阅读 LoopContext 后向其中的节点回复：
+
+```bash
+bcs-cli collaborate respond --run "$run_id" --node "$execution_node_id" --content '同意发布'
+```
+
+CLI 先核对该 execution ID 仍在服务端授权的待处理列表，只提交 `content`，不提交或修改 loop_context、
+iteration、outcome、actor。旧轮或未授权节点在 POST 前拒绝；查询后若状态变化，仍以服务端的冲突响应为准。
+Bot 身份不能借此充当人工用户。版本/能力警告和 authoring path 原样展示；生产 v2 仍默认关闭。
