@@ -1,8 +1,9 @@
 # DingTalk approval identity contract
 
-`card-web` approval pages authenticate an action with a short-lived DingTalk
-authorization code. A user identifier supplied by the browser is never an
-authorization credential.
+Approval actions use a server-verified identity. External `card-web` pages use
+a short-lived DingTalk authorization code, while the ClawWeb workbench uses
+its authenticated server session. A user identifier supplied by the browser
+is never an authorization credential.
 
 ## Browser flow
 
@@ -26,6 +27,20 @@ The resolve request body is:
   "comment": "optional"
 }
 ```
+
+## ClawWeb workbench flow
+
+The run detail and workflow workspace approval panels send the action to
+`POST /api/approval/:id/resolve/session`. The host resolves the current user
+from the ClawWeb login request and checks that server-verified user against the
+approval record. The browser does not send an `empId`, and this path does not
+require the DingTalk JSAPI.
+
+The public runner does not treat a decoded `IAM_TOKEN` payload as verified
+identity. In production, a host must inject an identity resolver that validates
+the login session with its identity provider before this endpoint can approve
+or reject. The public runner only retains its loopback `dev` identity for local
+testing; deployment hosts supply their own verified resolver.
 
 ## Compatibility
 
