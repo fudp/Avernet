@@ -86,6 +86,9 @@ provides:
   - BotCommonConfigRepository
   - BotCommonConfigRepositoryProtocol
   - DigitalEmployeeRepository
+  # bot_message_feedback
+  - BotMessageFeedbackRepository
+  - BotMessageFeedbackRepositoryProtocol
   # Contracts — protocols/<domain>.py. This is the surface domain services
   # import at runtime for DI; a change here is a change to their constructors.
   # bot
@@ -263,6 +266,7 @@ internal_dependencies:
   - agentclaw.community.core.bot_chat
   - agentclaw.community.core.bot_collaborator
   - agentclaw.community.core.bot_management
+  - agentclaw.community.core.bot_message_feedback  # BotMessageFeedback ORM model + record DTO used by the repository
   - agentclaw.community.core.bot_public
   - agentclaw.community.core.bot_config_manifest
   - agentclaw.community.core.bot_startup_script
