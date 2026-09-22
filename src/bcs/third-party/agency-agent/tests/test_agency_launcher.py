@@ -1,5 +1,6 @@
 """Regression tests for launcher lifecycle and user choices."""
 import json
+import stat
 import subprocess
 import unittest
 
@@ -435,6 +436,60 @@ class LauncherTest(LauncherFixture):
         self.assertNotIn('argument-sensitive', output)
         self.assertNotIn('test-token', self.calls.read_text())
 
+    def test_inline_token_is_persisted_and_scrubbed_from_the_process_list(self):
+        proc = self.launch(['engineering/backend'], ['--token', 'argument-sensitive'])
+        # The launcher lives in the foreground: its own argv must not retain the token.
+        self.wait_ready(proc)
+        ps = subprocess.run(['ps', '-p', str(proc.pid), '-o', 'command='],
+                            capture_output=True, text=True, timeout=10, check=True)
+        self.stop_process(proc)
+        self.assertNotIn('argument-sensitive', ps.stdout)
+        token_file = self.state_root / '.token'
+        self.assertEqual(token_file.read_text().strip(), 'argument-sensitive')
+        self.assertEqual(stat.S_IMODE(token_file.stat().st_mode), 0o600)
+        self.assertEqual(self.registrations[0]['token'], ['argument-sensitive'])
+        # New instances after the scrub register with the persisted token.
+        self.env.pop('BCS_REGISTER_TOKEN')
+        proc = self.launch(['design/reviewer'])
+        self.wait_ready(proc)
+        self.stop_process(proc)
+        self.assertEqual(self.registrations[1]['token'], ['argument-sensitive'])
+
+    def test_default_token_file_registers_without_inline_or_env_token(self):
+        self.env.pop('BCS_REGISTER_TOKEN')
+        self.state_root.mkdir(parents=True)
+        token_file = self.state_root / '.token'
+        token_file.write_text('file-token-sensitive')
+        token_file.chmod(0o600)
+        proc = self.launch(['engineering/backend'])
+        output = self.wait_ready(proc) + self.stop_process(proc)
+        self.assertEqual(self.registrations[0]['token'], ['file-token-sensitive'])
+        self.assertNotIn('file-token-sensitive', output)
+        self.assertNotIn('file-token-sensitive', self.calls.read_text())
+
+    def test_default_token_file_wins_over_environment(self):
+        # The persisted file is the explicit choice; a leftover env var must not
+        # silently override it (a scrubbed inline token relies on this order).
+        self.state_root.mkdir(parents=True)
+        token_file = self.state_root / '.token'
+        token_file.write_text('file-token-sensitive')
+        token_file.chmod(0o600)
+        proc = self.launch(['engineering/backend'])
+        self.wait_ready(proc)
+        self.stop_process(proc)
+        self.assertEqual(self.registrations[0]['token'], ['file-token-sensitive'])
+
+    def test_loose_default_token_file_still_works_but_warns(self):
+        self.env.pop('BCS_REGISTER_TOKEN')
+        self.state_root.mkdir(parents=True)
+        token_file = self.state_root / '.token'
+        token_file.write_text('file-token-sensitive')
+        token_file.chmod(0o644)
+        proc = self.launch(['engineering/backend'])
+        output = self.wait_ready(proc) + self.stop_process(proc)
+        self.assertEqual(self.registrations[0]['token'], ['file-token-sensitive'])
+        self.assertIn('chmod 600', output)
+
     def test_defaults_clone_once_and_read_default_openclaw_model(self):
         home = self.setup_defaults()
         default_config = home / '.openclaw/openclaw.json'
@@ -445,7 +500,7 @@ class LauncherTest(LauncherFixture):
         self.stop_process(proc)
         self.state_root = home / '.avernet/bcs/agency-agent'
         self.state = self.state_root / 'openclaw'
-        self.assertTrue((self.state_root / 'agency-agent/engineering/backend.md').is_file())
+        self.assertTrue((self.state_root / 'agency-agents/engineering/backend.md').is_file())
         config = json.loads(next(self.state.glob('backend-*/openclaw.json')).read_text())
         self.assertEqual(config['agents']['defaults']['model']['primary'], 'demo/test')
         self.assertEqual(list(config['channels']), ['bcs'])
@@ -470,7 +525,7 @@ class LauncherTest(LauncherFixture):
                                 timeout=15, check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('clone', result.stderr.lower())
-        self.assertFalse((self.state_root / 'agency-agent').exists())
+        self.assertFalse((self.state_root / 'agency-agents').exists())
         self.assertEqual(self.registrations, [])
         self.assertFalse(self.calls.exists())
         self.assertNotIn('unsafe-server-output', result.stdout + result.stderr)
@@ -478,7 +533,7 @@ class LauncherTest(LauncherFixture):
         proc = self.launch(['engineering/backend'], omit=('--agency-dir',))
         self.wait_ready(proc)
         self.stop_process(proc)
-        self.assertTrue((self.state_root / 'agency-agent/.git').is_dir())
+        self.assertTrue((self.state_root / 'agency-agents/.git').is_dir())
 
     def test_missing_default_model_fails_before_clone_or_registration(self):
         home = self.setup_defaults()
@@ -501,7 +556,7 @@ class LauncherTest(LauncherFixture):
 
     def test_existing_non_repository_cache_is_not_overwritten(self):
         self.setup_defaults()
-        cache = self.state_root / 'agency-agent'
+        cache = self.state_root / 'agency-agents'
         cache.mkdir(parents=True)
         (cache / 'keep.txt').write_text('existing user data')
         result = subprocess.run(self.command(['engineering/backend'], omit=('--agency-dir',)),

@@ -29,13 +29,17 @@ does not grant the permissions described by role text, and does not create frien
 Run from this directory (or replace the entry point with its full path):
 
 ```bash
+# Save the Human token once; the launcher reads it from there automatically
+# (keeps the token out of shell history and process lists)
+install -m 600 /dev/null ~/.avernet/bcs/agency-agent/.token
+# paste the token into ~/.avernet/bcs/agency-agent/.token with an editor
+
 # Start two profiles
 ./launch-agency.sh \
   --engine openclaw \
   --profile engineering/engineering-sre \
   --profile engineering/engineering-backend-architect \
-  --bcs-endpoint http://127.0.0.1:21000 \
-  --token '<human-register-token>'
+  --bcs-endpoint http://127.0.0.1:21000
 
 # Start the whole engineering team
 ./launch-agency.sh \
@@ -49,8 +53,7 @@ Run from this directory (or replace the entry point with its full path):
   --team engineering \
   --team design \
   --profile engineering/engineering-sre \
-  --bcs-endpoint http://127.0.0.1:21000 \
-  --token-file /path/to/register-token
+  --bcs-endpoint http://127.0.0.1:21000
 ```
 
 If you want the script itself without checking out Avernet, you can curl the entry point directly.
@@ -61,8 +64,7 @@ bundle to `~/.avernet/bcs/agency-agent/.bundle/` before starting:
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/inclusionAI/Avernet/refs/heads/dev/src/bcs/third-party/agency-agent/launch-agency.sh || echo exit\ 1)" --launch-agency.sh --engine openclaw \
   --profile engineering/engineering-sre \
   --profile engineering/engineering-backend-architect \
-  --bcs-endpoint http://127.0.0.1:21000 \
-  --token '<human-register-token>'
+  --bcs-endpoint http://127.0.0.1:21000
 ```
 
 The `bash -c` form only executes the entry script; the script itself fetches the rest of the files it needs.
@@ -72,13 +74,14 @@ The `bash -c` form only executes the entry script; the script itself fetches the
 | Option | Default / meaning |
 | --- | --- |
 | `--engine` | `openclaw`; only supported value |
+| `--lang` | `en` (default) or `zh`; selects the profile repository and isolates checkouts/instances per language |
 | `--profile TEAM/PROFILE` | repeatable; one role, optional `.md` suffix |
 | `--team TEAM` | repeatable; every agent in the team; overlaps with profiles are deduplicated |
-| `--agency-dir` | local checkout; defaults to cloning/reusing `<state-dir>/agency-agent` |
-| `--state-dir` | `~/.avernet/bcs/agency-agent`, shared root; instances live under `<state-dir>/<engine>` |
+| `--agency-dir` | local checkout; defaults to cloning/reusing `<state-dir>/agency-agents` (`agency-agents-zh` for `--lang zh`) |
+| `--state-dir` | `~/.avernet/bcs/agency-agent`, shared root; instances live under `<state-dir>/<engine>` (`<engine>-zh` for `--lang zh`) |
 | `--model-config` | `~/.openclaw/openclaw.json`, read-only extraction of model settings |
 | `--bcs-endpoint` | required, HTTP(S) BCS base URL; deployment prefixes are allowed |
-| `--token` / `--token-file` | mutually exclusive; otherwise `BCS_REGISTER_TOKEN` |
+| `--token` / `--token-file` | mutually exclusive; otherwise `<state-dir>/.token`, then `BCS_REGISTER_TOKEN` |
 | `--overwrite-profile` | accept all changed profile overwrites without prompting; does not re-register BCS |
 | `--overwrite-endpoint` | approve overwriting saved BCS endpoints and re-registering those instances without prompting |
 | `--reregister` | re-register every selected instance that already has a BCS session |
@@ -93,7 +96,13 @@ and `--reregister` instead.
 
 Human tokens have the same semantics as the legacy installer: they are Human registration tokens, not
 arbitrary user access tokens, and not Bot tokens. A command-line token can show up in shell history or
-process lists; use a `0600` file or environment variable if that matters. The launcher does not pass the
+process lists; prefer writing it once to `<state-dir>/.token` (`~/.avernet/bcs/agency-agent/.token` by
+default) with mode `0600` — when `--token`, `--token-file`, and `BCS_REGISTER_TOKEN` are all absent, the
+launcher reads the token from that file instead. A wider-permission token file still works but triggers
+a warning asking you to run `chmod 600`. If you do pass `--token` inline, the entry-point script
+(or the Python launcher when invoked directly) persists it to `<state-dir>/.token` (0600) and restarts
+without the flag, so no process in the launch chain — including `uv` or shell parents — keeps the token
+in its argv (`ps`) — it can still appear in your shell history. The launcher does not pass the
 registration token to OpenClaw or Git child processes, and it never prints it to the console.
 
 ## Parallel startup and colored logs
@@ -130,24 +139,42 @@ error for already authenticated connections.
 
 ## Persistent layout and reuse
 
+### Profile languages (`--lang`)
+
+Profiles are available in English from [agency-agents](https://github.com/msitarzewski/agency-agents)
+(`--lang en`, default) and in Chinese from
+[agency-agents-zh](https://github.com/jnMetaCode/agency-agents-zh) (`--lang zh`). The two languages are
+fully isolated: each gets its own read-only checkout (`agency-agents` / `agency-agents-zh`), its own
+instance scope (`openclaw` / `openclaw-zh`), its own BCS Bot identities, sessions, workspaces and
+memory. The same relative profile launched in both languages produces two independent instances with
+two independent Bots, and their Gateway ports are reserved across language scopes so both stacks can
+run concurrently. `instance.json` records the language; a saved instance whose language no longer
+matches the requested one is never silently reused.
+
 Default layout:
 
 ```text
 ~/.avernet/
   bcs/
     agency-agent/
-      agency-agent/                         # shared read-only agency-agents Git checkout
+      agency-agents/                        # shared read-only en checkout (agency-agents)
+      agency-agents-zh/                     # shared read-only zh checkout (agency-agents-zh)
       openclaw/
         .launcher.lock                      # per-engine lock only
         engineering-sre-<stable-path-hash>/ # isolated OpenClaw instance
         engineering-backend-architect-<hash>/
+      openclaw-zh/                          # isolated scope for --lang zh instances
+        .launcher.lock
+        ...
       codex/                                # reserved for future engines; currently unsupported
 ```
 
-On first use the launcher shallow-clones `https://github.com/msitarzewski/agency-agents.git` into
-`~/.avernet/bcs/agency-agent/agency-agent`, then reuses it without auto-pulling. The clone is written
-to a temporary directory first and moved into place only after success. If you pass `--agency-dir`, no
-Git operation is performed and no second checkout is made.
+On first use the launcher shallow-clones the repository for the selected `--lang`
+(`https://github.com/msitarzewski/agency-agents.git` for `en`,
+`https://github.com/jnMetaCode/agency-agents-zh.git` for `zh`) into the matching language-scoped
+directory under `~/.avernet/bcs/agency-agent/`, then reuses it without auto-pulling. The clone is
+written to a temporary directory first and moved into place only after success. If you pass
+`--agency-dir`, no Git operation is performed and no second checkout is made.
 
 Instance directory names are derived from the normalized repository-relative profile path, not from
 timestamps, randomness, content hashes, or selection order. **The engine directory provides the

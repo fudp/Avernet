@@ -27,13 +27,17 @@ HTTP/WebSocket 合同，而不是读取本仓库插件的实现。
 在本目录执行（或把入口替换为脚本的完整路径）：
 
 ```bash
+# 先把 Human token 保存一次， launcher 之后会自动读取
+#（避免 token 出现在 shell 历史或进程参数中）
+install -m 600 /dev/null ~/.avernet/bcs/agency-agent/.token
+# 用编辑器把 token 粘贴到 ~/.avernet/bcs/agency-agent/.token
+
 # 启动两个角色
 ./launch-agency.sh \
   --engine openclaw \
   --profile engineering/engineering-sre \
   --profile engineering/engineering-backend-architect \
-  --bcs-endpoint http://127.0.0.1:21000 \
-  --token '<human-register-token>'
+  --bcs-endpoint http://127.0.0.1:21000
 
 # 启动 engineering 团队全部角色
 ./launch-agency.sh \
@@ -47,8 +51,7 @@ HTTP/WebSocket 合同，而不是读取本仓库插件的实现。
   --team engineering \
   --team design \
   --profile engineering/engineering-sre \
-  --bcs-endpoint http://127.0.0.1:21000 \
-  --token-file /path/to/register-token
+  --bcs-endpoint http://127.0.0.1:21000
 ```
 
 如果只想拿到脚本本体，也可以直接 curl 入口文件。它会先检查本目录内是否已有
@@ -60,8 +63,7 @@ README 里：
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/inclusionAI/Avernet/refs/heads/dev/src/bcs/third-party/agency-agent/launch-agency.sh || echo exit\ 1)" --launch-agency.sh --engine openclaw \
   --profile engineering/engineering-sre \
   --profile engineering/engineering-backend-architect \
-  --bcs-endpoint http://127.0.0.1:21000 \
-  --token '<human-register-token>'
+  --bcs-endpoint http://127.0.0.1:21000
 ```
 
 注意上面的 `bash -c` 用法只是执行入口脚本；脚本会自行完成其余文件的获取。
@@ -72,8 +74,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/inclusionAI/Avernet/refs
   --engine openclaw \
   --profile engineering/engineering-sre \
   --profile engineering/engineering-backend-architect \
-  --bcs-endpoint http://127.0.0.1:21000 \
-  --token '<human-register-token>'
+  --bcs-endpoint http://127.0.0.1:21000
 
 # 启动 engineering 团队全部角色
 ./launch-agency.sh \
@@ -87,8 +88,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/inclusionAI/Avernet/refs
   --team engineering \
   --team design \
   --profile engineering/engineering-sre \
-  --bcs-endpoint http://127.0.0.1:21000 \
-  --token-file /path/to/register-token
+  --bcs-endpoint http://127.0.0.1:21000
 ```
 
 `--profile` 使用 **team/profile**，即仓库相对 Markdown 路径去掉 `.md` 后缀；
@@ -128,13 +128,14 @@ Continue launching all 12 agents? [y/N]
 | 参数 | 默认值 / 含义 |
 | --- | --- |
 | `--engine` | `openclaw`，目前只接受这个值 |
+| `--lang` | `en`（默认）或 `zh`；选择角色仓库语言，缓存与实例按语言隔离 |
 | `--profile TEAM/PROFILE` | 可重复，选择一个角色；允许 `.md` 后缀 |
 | `--team TEAM` | 可重复，选择团队全部角色；与 profile 合并去重 |
-| `--agency-dir` | 指定本地仓库；省略时首次克隆/之后复用 `<state-dir>/agency-agent` |
-| `--state-dir` | `~/.avernet/bcs/agency-agent`，共享根目录；实例位于 `<state-dir>/<engine>` |
+| `--agency-dir` | 指定本地仓库；省略时首次克隆/之后复用 `<state-dir>/agency-agents`（`--lang zh` 时为 `agency-agents-zh`） |
+| `--state-dir` | `~/.avernet/bcs/agency-agent`，共享根目录；实例位于 `<state-dir>/<engine>`（`--lang zh` 时为 `<engine>-zh`） |
 | `--model-config` | `~/.openclaw/openclaw.json`，只读提取模型配置 |
 | `--bcs-endpoint` | 必填，HTTP(S) BCS 根地址，可带部署路径前缀 |
-| `--token` / `--token-file` | 互斥；省略时使用 `BCS_REGISTER_TOKEN` |
+| `--token` / `--token-file` | 互斥；都没有时依次使用 `<state-dir>/.token`、`BCS_REGISTER_TOKEN` |
 | `--overwrite-profile` | 自动同意覆盖所有发生变化的本地 profile；**不**重新注册 BCS |
 | `--overwrite-endpoint` | 自动同意覆盖保存的 BCS endpoint 并重新注册受影响实例 |
 | `--reregister` | 自动同意重新注册所有已有 session 的选中实例 |
@@ -148,9 +149,14 @@ Continue launching all 12 agents? [y/N]
 `--reregister`，旧名称会报参数错误，不会悄悄做其他操作。
 
 Human token 与单实例安装流程使用相同注册语义，不是任意用户访问令牌，也不是
-已有 Bot token。命令行 token 可能出现在 shell 历史或进程参数中；需要避免时使用
-权限为 `0600` 的文件或环境变量。脚本不把注册 token 传给 OpenClaw/Git 子进程，
-也不在控制台打印。生产环境请用 HTTPS/WSS。
+已有 Bot token。命令行 token 可能出现在 shell 历史或进程参数中；推荐先写入一次
+`<state-dir>/.token`（默认 `~/.avernet/bcs/agency-agent/.token`）并设置权限 `0600`——
+当 `--token`、`--token-file`、`BCS_REGISTER_TOKEN` 都未提供时，脚本自动从该文件
+读取 token。文件权限过宽时仍能使用，但会警告提示执行 `chmod 600`。即使从命令行使用
+`--token`，入口脚本（或直接运行 Python launcher 时由 launcher 自身）也会先把它写入
+`<state-dir>/.token`（0600），再以不含该参数的形式重启，整条启动链（含 `uv`、shell
+父进程）都不会把 token 留在进程列表（`ps`）中——但仍可能留在 shell 历史里。脚本不把
+注册 token 传给 OpenClaw/Git 子进程，也不在控制台打印。生产环境请用 HTTPS/WSS。
 
 ## 并行启动与彩色日志
 
@@ -184,24 +190,40 @@ pending 仍是警告，不会让其余已认证连接失败。
 
 ## 持久化目录与复用
 
+### Profile 语言（`--lang`）
+
+Profile 有两个来源：英文版 [agency-agents](https://github.com/msitarzewski/agency-agents)
+（`--lang en`，默认）和中文版 [agency-agents-zh](https://github.com/jnMetaCode/agency-agents-zh)
+（`--lang zh`）。两种语言完全隔离：各自的只读缓存目录（`agency-agents` / `agency-agents-zh`）、
+各自的实例作用域（`openclaw` / `openclaw-zh`）、各自独立的 BCS Bot 身份、session、workspace
+和记忆。同一个相对路径的 profile 在两种语言下各启动一次，会得到两个互不相干的实例和 Bot；
+端口会跨语言作用域预留，两套实例可以同时运行。`instance.json` 会记录语言；已保存实例的语言
+与本次请求不一致时拒绝复用，不会静默串用。
+
 默认目录结构：
 
 ```text
 ~/.avernet/
   bcs/
     agency-agent/
-      agency-agent/                         # agency-agents Git 仓库缓存，共享只读来源
+      agency-agents/                        # 英文 agency-agents Git 仓库缓存，共享只读来源
+      agency-agents-zh/                     # 中文 agency-agents-zh Git 仓库缓存，共享只读来源
       openclaw/
         .launcher.lock                      # 仅限制同一引擎的启动器
         engineering-sre-<stable-path-hash>/ # OpenClaw 独立实例
         engineering-backend-architect-<hash>/
+      openclaw-zh/                          # --lang zh 实例的隔离作用域
+        .launcher.lock
+        ...
       codex/                                # 引擎布局预留，当前不支持启动 Codex
         ...                                 # 不被 OpenClaw 操作扫描或修改
 ```
 
-首次从 `https://github.com/msitarzewski/agency-agents.git` 浅克隆仓库，之后复用，
-不自动 pull。克隆先写临时目录，成功后才放入固定位置；失败不会保留半成品仓库。
-显式指定 `--agency-dir` 时不执行 Git 操作，也不复制一份新仓库。
+首次启动时按所选 `--lang` 浅克隆对应仓库（`en` 为
+`https://github.com/msitarzewski/agency-agents.git`，`zh` 为
+`https://github.com/jnMetaCode/agency-agents-zh.git`）到对应语言目录，之后复用，不自动
+pull。克隆先写临时目录，成功后才放入固定位置；失败不会保留半成品仓库。显式指定
+`--agency-dir` 时不执行 Git 操作，也不复制一份新仓库。
 
 实例目录名由**规范化后的仓库相对路径**决定，保留原有稳定的路径 hash 算法，
 不使用随机数、时间戳、内容 hash 或选择顺序作为目录名。**引擎由父目录隔离**，

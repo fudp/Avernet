@@ -29,6 +29,7 @@ from agency_profiles import (
     load_profiles,
 )
 from agency_runtime import (
+    AGENCY_REPOSITORIES,
     PLUGIN_ID,
     OpenClaw,
     RequestFailed,
@@ -61,7 +62,11 @@ def arguments() -> argparse.Namespace:
         'Runs in the foreground; Ctrl+C stops owned Gateways but keeps credentials. '
         'Model credentials must be supplied via provider environment variables or the model JSON.'))
     parser.add_argument('--agency-dir', type=Path,
-                        help='local checkout; default: clone/reuse <state-dir>/agency-agent')
+                        help='local checkout; default: clone/reuse <state-dir>/<agency-agents[-zh]> for --lang')
+    parser.add_argument('--lang', default='en', choices=sorted(AGENCY_REPOSITORIES),
+                        help='profile language: en uses github.com/msitarzewski/agency-agents, '
+                             'zh uses github.com/jnMetaCode/agency-agents-zh; checkouts and instances '
+                             'are isolated per language (-zh directory suffix)')
     parser.add_argument('--engine', default='openclaw', choices=['openclaw'],
                         help='agent engine (currently only openclaw is supported)')
     parser.add_argument('--profile', dest='selections', action=AgentSelection, const='profile',
@@ -72,8 +77,11 @@ def arguments() -> argparse.Namespace:
                         help='model JSON (default: ~/.openclaw/openclaw.json); other settings are ignored')
     parser.add_argument('--bcs-endpoint', required=True, help='HTTP(S) BCS base URL, including deployment prefix if needed')
     credentials = parser.add_mutually_exclusive_group()
-    credentials.add_argument('--token', help='Human/User registration token, as in install.sh')
-    credentials.add_argument('--token-file', type=Path, help='registration token file; otherwise BCS_REGISTER_TOKEN')
+    credentials.add_argument('--token', help='Human/User registration token, as in install.sh; '
+                                             'persisted to <state-dir>/.token and removed from the '
+                                             'process list before any Gateway starts')
+    credentials.add_argument('--token-file', type=Path,
+                             help='registration token file; otherwise <state-dir>/.token, then BCS_REGISTER_TOKEN')
     parser.add_argument('--overwrite-profile', action='store_true', help='accept all changed profile overwrites without prompting')
     parser.add_argument('--overwrite-endpoint', action='store_true', help='overwrite saved BCS endpoint settings and re-register affected instances without prompting')
     parser.add_argument('--reregister', action='store_true', help='re-register every selected instance that already has a BCS session')
@@ -160,6 +168,21 @@ def prepare_plans(args, profiles, root: Path, ws_url: str, registration_proof: s
         if type(port) is not int or not 1024 <= port <= 65515:
             raise ValueError('invalid saved Gateway port; repair instance.json')
         occupied.append(port)
+    # Ports are reserved across all language scopes of this engine so an English
+    # and a Chinese stack can run concurrently without port collisions. Sibling
+    # records are advisory only: an unreadable one is skipped (its own scope's
+    # launch still validates it), and a live port owner is caught by port_available.
+    for sibling in root.parent.iterdir():
+        if sibling == root or not (sibling.name == args.engine
+                                   or sibling.name.startswith(args.engine + '-')):
+            continue
+        for record_path in sibling.glob('*/instance.json'):
+            try:
+                sibling_port = read_json(record_path).get('port')
+            except (ValueError, TypeError):
+                continue
+            if type(sibling_port) is int:
+                occupied.append(sibling_port)
     plans: list[LaunchPlan] = []
     for profile in profiles:
         state = root / profile.instance_id
@@ -169,6 +192,8 @@ def prepare_plans(args, profiles, root: Path, ws_url: str, registration_proof: s
         if record:
             if record.get('engine', 'openclaw') != args.engine:
                 raise ValueError(f'{profile.instance_id}: saved engine differs; refusing to reuse its state')
+            if record.get('lang', 'en') != args.lang:
+                raise ValueError(f'{profile.instance_id}: saved profile language differs; refusing to reuse its state')
             if record.get('profile_path') != profile.path:
                 raise ValueError(f'{profile.instance_id}: saved profile path differs; refusing to reuse its state')
             if record.get('plugin') != args.bcn_plugin:
@@ -195,7 +220,7 @@ def prepare_plans(args, profiles, root: Path, ws_url: str, registration_proof: s
             raise ValueError(f'{profile.instance_id}: BCS re-registration outcome unknown; '
                              'recover credentials or reconcile bcs-reregistration.pending.json before retrying')
         if session is None and not endpoint_changed and not registration_proof:
-            raise ValueError('new instances require --token, --token-file or BCS_REGISTER_TOKEN')
+            raise ValueError('new instances require --token, --token-file, <state-dir>/.token or BCS_REGISTER_TOKEN')
         port_available(port)
         plans.append(LaunchPlan(profile, state, port, record, session, endpoint_changed))
     return plans
@@ -228,7 +253,7 @@ def resolve_endpoint_changes(plans: list[LaunchPlan], args, ws_url: str,
                          '--overwrite-endpoint, or run with the original --bcs-endpoint')
     if not registration_proof:
         raise ValueError('overwriting the endpoint re-registers Bots; provide '
-                         '--token, --token-file or BCS_REGISTER_TOKEN')
+                         '--token, --token-file, <state-dir>/.token or BCS_REGISTER_TOKEN')
     stamp = str(time.time_ns())
     for plan in changed:
         session_path = plan.state / '.bcs/session.json'
@@ -273,7 +298,8 @@ def choose_profile_actions(plans: list[LaunchPlan], args, registration_proof: st
     else:
         do_reregister = False
     if do_reregister and not registration_proof:
-        raise ValueError('BCS re-registration requires --token, --token-file or BCS_REGISTER_TOKEN')
+        raise ValueError('BCS re-registration requires --token, --token-file, '
+                         '<state-dir>/.token or BCS_REGISTER_TOKEN')
     for plan in existing:
         plan.reregister = do_reregister
 
@@ -285,7 +311,7 @@ def prepare_workspace(profile, state: Path, port: int, args, model: dict, ws_url
     write_json(state / 'instance.json', {
         'profile_path': profile.path, 'source_sha256': profile.digest,
         'source_root': str(args.agency_dir.resolve()), 'bcs_url': ws_url,
-        'port': port, 'plugin': args.bcn_plugin, 'engine': args.engine,
+        'port': port, 'plugin': args.bcn_plugin, 'engine': args.engine, 'lang': args.lang,
     })
     snapshot = state / 'profile.md'
     if overwrite_profile and snapshot.exists():
@@ -370,6 +396,21 @@ def publish_capabilities(runtime: OpenClaw, endpoint: str, profile, state: Path,
     return False
 
 
+def default_token(state_dir: Path) -> str:
+    """Load the persisted registration token at <state-dir>/.token (kept out of
+    command lines and process lists); empty string when the file does not exist."""
+    path = state_dir.expanduser() / '.token'
+    if not path.is_file():
+        return ''
+    try:
+        token = path.read_text(encoding='utf-8').strip()
+    except OSError:
+        raise ValueError(f'cannot read the registration token file: {path}') from None
+    if token and path.stat().st_mode & 0o077:
+        report(f'WARNING: {path} is readable by other users; run: chmod 600 {path}', 'warning')
+    return token
+
+
 def run(args) -> None:
     model = load_model_config(args.model_config.expanduser())
     endpoint, ws_url = endpoint_urls(args.bcs_endpoint)
@@ -381,17 +422,19 @@ def run(args) -> None:
     elif args.token_file:
         registration_proof = args.token_file.expanduser().read_text(encoding='utf-8').strip()
     else:
-        registration_proof = os.environ.get('BCS_REGISTER_TOKEN', '').strip()
+        registration_proof = default_token(args.state_dir)
+        if not registration_proof:
+            registration_proof = os.environ.get('BCS_REGISTER_TOKEN', '').strip()
     root = args.state_dir.expanduser().resolve()
     if any(root.glob('*/instance.json')):
         raise ValueError('legacy flat instance layout detected; move the instance into <state-dir>/<engine>/ or choose a different state directory')
     if args.agency_dir is None:
         # Serialize only shared checkout setup, not the lifetime of another engine.
         with state_lock(root):
-            args.agency_dir = ensure_agency_checkout(root)
+            args.agency_dir = ensure_agency_checkout(root, args.lang)
     else:
         args.agency_dir = args.agency_dir.expanduser()
-    engine_root = root / args.engine
+    engine_root = root / (args.engine if args.lang == 'en' else f'{args.engine}-{args.lang}')
     with state_lock(engine_root):
         profiles = load_profiles(args.agency_dir, args.selections)
         if not confirm_team_size(args.selections, len(profiles)):
@@ -461,8 +504,40 @@ def run(args) -> None:
             runtime.close()
 
 
+TOKEN_SCRUB_ENV = 'AGENCY_LAUNCHER_TOKEN_SCRUBBED'
+
+
+def scrub_inline_token(args: argparse.Namespace) -> None:
+    """Persist an inline --token to <state-dir>/.token (0600), then re-exec this
+    launcher with --token removed. The launcher runs in the foreground, so an
+    inline token would stay visible in `ps` output for the whole session."""
+    token = args.token.strip()
+    if not token:
+        return
+    if os.environ.get(TOKEN_SCRUB_ENV):
+        # execv replaces argv, so a scrubbed process can never re-enter here.
+        raise ValueError('token scrub failed to remove --token from the command line')
+    write_private(args.state_dir.expanduser() / '.token', token + '\n')
+    scrubbed: list[str] = []
+    skip_next = False
+    for raw in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if raw == '--token':
+            skip_next = True
+            continue
+        if raw.startswith('--token='):
+            continue
+        scrubbed.append(raw)
+    os.environ[TOKEN_SCRUB_ENV] = '1'
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), *scrubbed])
+
+
 def main() -> int:
     args = arguments()
+    if args.token:
+        scrub_inline_token(args)  # Replaces the process; never returns on success.
     def interrupted(*_):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
