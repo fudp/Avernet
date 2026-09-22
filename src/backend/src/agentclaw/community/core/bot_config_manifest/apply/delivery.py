@@ -28,14 +28,17 @@ container, through the same device-backed ports ARCA uses. That is
 :class:`TeclawPlatformDelivery`. Which of the two a deployment runs is a
 :class:`TeclawDeliveryMode`, read once from
 ``user_config.bot_config_manifest.teclaw_platform_managed`` (default off) by
-:func:`teclaw_delivery_mode_from_config` and turned into *one built strategy*
-by :data:`TECLAW_DELIVERY_BY_MODE` in the composition root.
+:func:`teclaw_delivery_mode_from_config`. The composition root binds each of
+the two through a provider of its own, and a third provider per mode puts *one*
+of them in the family map :class:`DeliveryStrategyFactory` is built over — so
+the strategy an apply can reach is settled by the deployment, and no strategy
+holds the mode that settled it.
 
-That is the whole of the mode's life: a yaml scalar, a table row, an object.
-No strategy carries it as a field and nothing re-reads it per apply, because
-the answer cannot change while the process runs — a deployment-time fact is
-settled at deployment time, and a component that held it would have to be
-asked the same question on every call, in front of every bot. What each
+That is the whole of the mode's life: a yaml scalar, one row of two, an
+object. No strategy carries it as a field and nothing re-reads it per apply,
+because the answer cannot change while the process runs — a deployment-time
+fact is settled at deployment time, and a component that held it would have to
+be asked the same question on every call, in front of every bot. What each
 strategy holds instead is only what its own shape needs: the platform one has
 store-backed ports and a closing redeliver, the device one has device-backed
 ports and no closing step at all. Neither can be handed the other's
@@ -44,13 +47,14 @@ collaborators, because neither takes them.
 **Nothing here branches on a family or a mode either.** ``phase_of`` is a table
 lookup in a per-strategy phase map (:data:`_ARCA_PHASES`,
 :data:`_TECLAW_PLATFORM_PHASES`, :data:`_TECLAW_DEVICE_PHASES`), selecting the
-teclaw implementation is a lookup in :data:`TECLAW_DELIVERY_BY_MODE`, and
-:class:`DeliveryStrategyFactory` is a lookup in a
-:class:`EngineFamily`-keyed mapping the composition root hands it. Each table
-is checked for exhaustiveness at import — the discipline
-``source_fetchers.FETCHER_TYPES`` sets — so a family or a construct with no
-answer fails at boot rather than ``KeyError``-ing mid-apply with the bot's
-lock held.
+teclaw implementation is a provider that is effective for one mode and returns
+nothing for the other, and :class:`DeliveryStrategyFactory` is a lookup in a
+:class:`EngineFamily`-keyed mapping the DI graph assembles for it. The phase
+tables are checked for exhaustiveness at import — the discipline
+``source_fetchers.FETCHER_TYPES`` sets — and the family mapping is checked when
+the factory is constructed, so a construct with no phase, or a family with no
+strategy, fails before an apply rather than ``KeyError``-ing mid-apply with the
+bot's lock held.
 """
 from __future__ import annotations
 
@@ -58,7 +62,17 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from types import MappingProxyType
 from abc import abstractmethod
-from typing import Any, Awaitable, Callable, ClassVar, Mapping, Optional, Protocol
+from typing import (
+    Annotated,
+    Any,
+    Awaitable,
+    Callable,
+    ClassVar,
+    Dict,
+    Mapping,
+    Optional,
+    Protocol,
+)
 
 from agentclaw.community.core.ports.activation_port import (
     ActivationPort,
@@ -157,8 +171,8 @@ class MaterialiserPorts:
     teclaw binds store-backed ports, and each field is typed by the narrow port
     the materialiser calls through so the two are interchangeable by shape.
 
-    Created by: the composition root, as the two lazy bundles it binds — the
-    device-backed one and the store-backed one.
+    Created by: the composition root, as the two lazy bundles it binds —
+    :data:`DevicePorts` and :data:`PlatformPorts`.
     Consumed by: ``apply/registry.build_materialisers``, via
     :meth:`as_kwargs`.
     """
@@ -194,6 +208,28 @@ class MaterialiserPorts:
             "resource_service": self.resource_service,
             "cli_tool_service": self.cli_tool_service,
         }
+
+
+#: A port bundle that has not been built yet. Every field behind one reaches
+#: either the device graph or the object store, so a strategy is bound holding
+#: the thunk and calls it once per apply.
+LazyPorts = Callable[[], MaterialiserPorts]
+
+# ── Injector qualifiers (Guice @Named-style) ─────────────────────────────────
+# The SAME :data:`LazyPorts` shape, bound once per write path: one bundle writes
+# through a live container, the other into the platform's own store. Bind and
+# inject them as :data:`DevicePorts` / :data:`PlatformPorts` — never as a bare
+# ``LazyPorts``, which would make the two one key and let whichever provider the
+# composition root installed last answer for both.
+QUALIFIER_DEVICE_PORTS = "device-ports"
+QUALIFIER_PLATFORM_PORTS = "platform-ports"
+
+#: ARCA's whole binding, and the device-backed teclaw shape's ports — the
+#: bundle whose writes go through a live container.
+DevicePorts = Annotated[LazyPorts, QUALIFIER_DEVICE_PORTS]
+#: Platform-managed teclaw's ports — the bundle that writes platform state, and
+#: whose artifact is the delivery.
+PlatformPorts = Annotated[LazyPorts, QUALIFIER_PLATFORM_PORTS]
 
 
 class DeliveryStrategy(Protocol):
@@ -407,7 +443,7 @@ class ArcaDelivery(_PhaseTableDelivery):
     creation_sequence = CreationSequence.CREATE_BETWEEN_PHASES
     _PHASES = _ARCA_PHASES
 
-    def __init__(self, ports: Callable[[], MaterialiserPorts]) -> None:
+    def __init__(self, ports: LazyPorts) -> None:
         self._ports = ports
 
     def needs_container(self) -> bool:
@@ -458,7 +494,7 @@ class TeclawPlatformDelivery(_PhaseTableDelivery):
     def __init__(
         self,
         *,
-        ports: Callable[[], MaterialiserPorts],
+        ports: LazyPorts,
         redeliver: Redeliver,
     ) -> None:
         self._ports = ports
@@ -514,7 +550,7 @@ class TeclawDeviceDelivery(_PhaseTableDelivery):
     def __init__(
         self,
         *,
-        ports: Callable[[], MaterialiserPorts],
+        ports: LazyPorts,
         cli_tool_service: Callable[[], CliToolService],
     ) -> None:
         self._ports = ports
@@ -534,104 +570,30 @@ class TeclawDeviceDelivery(_PhaseTableDelivery):
         return None
 
 
-@dataclass(frozen=True)
-class TeclawPlatformBindings:
-    """What the platform-managed teclaw path needs bound, as one DI value.
-
-    Two fields, both callables, so nothing is resolved until an apply actually
-    runs on a teclaw bot::
-
-        TeclawPlatformBindings(
-            platform_ports=lambda: MaterialiserPorts(...),  # store-backed
-            redeliver=<an async (ApplyContext) -> Optional[str]>,
-        )
-
-    Created by: the composition root, in the manifest-fetch graph beside the
-    store these ports write to.
-    Consumed by: :class:`TeclawDeliveryBindings`, and the W9 CLI service
-    factory, whose ``teclaw-live`` binding pushes through the same redeliver.
-    """
-
-    #: Builds the store-backed port bundle. Lazy: it reaches the object store
-    #: graph.
-    platform_ports: Callable[[], MaterialiserPorts]
-    #: The closing whole-artifact redeliver. See :data:`Redeliver`.
-    redeliver: Redeliver
-
-
-@dataclass(frozen=True)
-class TeclawDeliveryBindings:
-    """Everything either teclaw strategy is built from, as one DI value.
-
-    Four fields, of which each row of :data:`TECLAW_DELIVERY_BY_MODE` reads the
-    two its own mode needs and never touches the other two. They share one
-    bundle so the rows share one signature — that is what lets the selection be
-    a table lookup instead of a branch that knows what each arm wants. Every
-    field is a callable, so binding all four resolves nothing: only the
-    strategy the mode names is built, and even that one reaches its graph no
-    earlier than the first apply.
-
-    Created by: the composition root.
-    Consumed by: :func:`teclaw_delivery_for_mode`.
-    """
-
-    #: Store-backed ports — ``PLATFORM``'s write targets.
-    platform_ports: Callable[[], MaterialiserPorts]
-    #: Device-backed ports, the bundle ARCA also runs on — ``DEVICE``'s.
-    device_ports: Callable[[], MaterialiserPorts]
-    #: ``PLATFORM``'s closing step. See :data:`Redeliver`.
-    redeliver: Redeliver
-    #: The teclaw-bound CLI service ``DEVICE`` substitutes into its bundle.
-    cli_tool_service: Callable[[], CliToolService]
-
-
-#: Which teclaw strategy a deployment's mode names, and how it is built.
+#: One built strategy per family — :class:`DeliveryStrategyFactory`'s other
+#: argument, and the key the composition root's per-family and per-mode
+#: providers contribute to.
 #:
-#: One row per :class:`TeclawDeliveryMode`, exhaustive by construction (the
-#: import-time check below). Supporting a third shape is a class and a row, the
-#: way ``source_fetchers.FETCHER_TYPES`` takes a protocol; retiring the
-#: device-backed shape is deleting a row, a class and an enum member, and
-#: nothing else in the feature has to be found and unbranched first.
-TECLAW_DELIVERY_BY_MODE: Mapping[
-    TeclawDeliveryMode, Callable[[TeclawDeliveryBindings], DeliveryStrategy]
-] = MappingProxyType({
-    TeclawDeliveryMode.PLATFORM: lambda bindings: TeclawPlatformDelivery(
-        ports=bindings.platform_ports, redeliver=bindings.redeliver
-    ),
-    TeclawDeliveryMode.DEVICE: lambda bindings: TeclawDeviceDelivery(
-        ports=bindings.device_ports, cli_tool_service=bindings.cli_tool_service
-    ),
-})
+#: ``Dict`` rather than ``Mapping`` because that is what injector keys a map
+#: multibinding by: a ``Mapping[...]`` interface would be read as a *list*
+#: multibinding and the contributions concatenated instead of merged. Spelled
+#: once, here, so no binding site has to know that — or get ``typing.Dict`` and
+#: ``dict`` (which are not the same key) the same way round by hand.
+DeliveryStrategies = Dict[EngineFamily, DeliveryStrategy]
 
-_UNBUILT_MODES = set(TeclawDeliveryMode) - set(TECLAW_DELIVERY_BY_MODE)
-if _UNBUILT_MODES:
-    # At import, never at boot-and-then-first-apply. A mode a deployment can
-    # write into its yaml and nothing can build is "the surface accepts what it
-    # cannot run" — the rule this whole feature is built around.
-    raise RuntimeError(
-        "every teclaw delivery mode needs a strategy; missing: "
-        + ", ".join(sorted(m.value for m in _UNBUILT_MODES))
-    )
-
-
-def teclaw_delivery_for_mode(
-    mode: TeclawDeliveryMode, bindings: TeclawDeliveryBindings
-) -> DeliveryStrategy:
-    """The one teclaw strategy this deployment runs.
-
-    Called once, by the composition root::
-
-        teclaw_delivery_for_mode(config.teclaw_delivery_mode, bindings)
-
-    The other mode's strategy is never built, so nothing downstream can be
-    handed it by accident and nothing has to ask which mode it is holding.
-    """
-    return TECLAW_DELIVERY_BY_MODE[mode](bindings)
+#: The family adapter, named — :func:`family_from_engine_test`'s answer and
+#: the argument :class:`DeliveryStrategyFactory` takes.
+#:
+#: An alias rather than a new type, so it is the same binding key a bare
+#: ``Callable[[Optional[str]], EngineFamily]`` annotation would be; what it adds
+#: is a name for the thing at the composition root, where it is bound, and at
+#: the factory, where it is read.
+EngineFamilyOf = Callable[[Optional[str]], EngineFamily]
 
 
 def family_from_engine_test(
     is_teclaw: Callable[[Optional[str]], bool],
-) -> Callable[[Optional[str]], EngineFamily]:
+) -> EngineFamilyOf:
     """Adapt the engine authority's yes/no into the family key.
 
     ``TeclawProvisionService.is_teclaw`` answers a boolean because that is the
@@ -658,20 +620,17 @@ class DeliveryStrategyFactory:
     a bot's family::
 
         DeliveryStrategyFactory(
-            family_of=family_from_engine_test(provisioning.is_teclaw),
-            strategies={
-                EngineFamily.ARCA: ArcaDelivery(device_ports),
-                EngineFamily.TECLAW: teclaw_delivery_for_mode(mode, bindings),
-            },
+            family_of=injector.get(EngineFamilyOf),
+            strategies=injector.get(DeliveryStrategies),
         )
 
     It builds nothing and configures nothing. Which teclaw shape sits in that
-    second row was settled in the composition root, by
-    :data:`TECLAW_DELIVERY_BY_MODE`; what reaches this class is an object that
-    already knows how it delivers. So there is no switch to read here, no
-    collaborator to pass through to a constructor, and no misconfiguration left
-    to refuse — a strategy that could not be built was not bound, and a family
-    with no strategy fails below, at boot.
+    mapping's teclaw row was settled in the composition root, by which of the
+    two per-mode providers was effective there; what reaches this class is an
+    object that already knows how it delivers. So there is no switch to read
+    here, no collaborator to pass through to a constructor, and no
+    misconfiguration left to refuse — a strategy that could not be built was
+    not bound, and a family with no strategy fails below, at construction.
 
     Created by: the composition root.
     Consumed by: the apply service, which asks it per apply and per bot.
@@ -680,7 +639,7 @@ class DeliveryStrategyFactory:
     def __init__(
         self,
         *,
-        family_of: Callable[[Optional[str]], EngineFamily],
+        family_of: EngineFamilyOf,
         strategies: Mapping[EngineFamily, DeliveryStrategy],
     ) -> None:
         unserved = set(EngineFamily) - set(strategies)
@@ -711,19 +670,22 @@ class DeliveryStrategyFactory:
 __all__ = [
     "ArcaDelivery",
     "CreationSequence",
+    "DeliveryStrategies",
     "DeliveryStrategy",
     "DeliveryStrategyFactory",
+    "DevicePorts",
     "EngineFamily",
+    "EngineFamilyOf",
+    "LazyPorts",
     "MaterialiserPorts",
+    "PlatformPorts",
+    "QUALIFIER_DEVICE_PORTS",
+    "QUALIFIER_PLATFORM_PORTS",
     "Redeliver",
-    "TECLAW_DELIVERY_BY_MODE",
     "TECLAW_PLATFORM_MANAGED_KEY",
-    "TeclawDeliveryBindings",
     "TeclawDeliveryMode",
     "TeclawDeviceDelivery",
-    "TeclawPlatformBindings",
     "TeclawPlatformDelivery",
     "family_from_engine_test",
-    "teclaw_delivery_for_mode",
     "teclaw_delivery_mode_from_config",
 ]
