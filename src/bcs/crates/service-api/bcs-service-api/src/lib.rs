@@ -221,6 +221,7 @@ pub use port::{
     HumanInputRequestRepoPort,
     FriendConnectNotificationCommand, FriendConnectNotificationKind,
     FriendConnectNotificationPort, NoopFriendConnectNotificationPort,
+    FriendAuthSyncAction, FriendAuthSyncCommand, FriendAuthSyncPort, NoopFriendAuthSyncPort,
     FriendRepoPort, FriendRequestRepoPort, FrontendDeliveryCommand, FrontendDeliveryKind,
     FrontendDeliveryPort, FrontendDeliveryResult, FrontendDeliveryTarget, GroupDispatchContextPort,
     GroupHistoryBotRequestPort, GroupMetricCount, GroupMetricsSnapshotPort, GroupRepoPort,
