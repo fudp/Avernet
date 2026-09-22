@@ -137,6 +137,7 @@ mod friend_auth_sync;
 mod friend_connect_notification;
 pub use friend_auth_sync::HttpFriendAuthSyncPort;
 pub mod http_adapter;
+pub mod agent_identity;
 mod identity_wiring;
 pub mod lifecycle;
 pub mod metrics;
