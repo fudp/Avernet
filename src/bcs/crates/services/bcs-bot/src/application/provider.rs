@@ -3,9 +3,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bcs_service_api::core::provider::BotWebhookChange;
 use bcs_service_api::{
-    ActorKind, BotControlPlaneCoreService, BotRegistryCoreService, BotTaskModesQuery,
+    ActorKind, BotCatalogCleanupPort, BotControlPlaneCoreService, BotRegistryCoreService,
+    BotTaskModesQuery,
     ChannelBindingCleanupPort, DeleteProviderBotCommand, DeleteProviderBotOutcome,
-    NoopChannelBindingCleanupPort, ProviderBotBinding, ProviderBotCoreService,
+    NoopBotCatalogCleanupPort, NoopChannelBindingCleanupPort, ProviderBotBinding,
+    ProviderBotCoreService,
     ProviderBotRosterItem, ProviderBotTaskModesFilter, ProviderCoreService,
     ProviderManagementService, ProviderRecord, RegisterProviderBotCommand,
     RegisterProviderBotOutcome, RegisterProviderBotParams, RegisterProviderCommand,
@@ -21,6 +23,7 @@ pub struct ProviderManagement {
     registry: Arc<dyn BotRegistryCoreService>,
     relation: Arc<dyn RelationCoreService>,
     channel_binding_cleanup: Arc<dyn ChannelBindingCleanupPort>,
+    bot_catalog_cleanup: Arc<dyn BotCatalogCleanupPort>,
     user_directory: Option<Arc<dyn UserDirectoryPlugin>>,
     control_plane: Option<Arc<dyn BotControlPlaneCoreService>>,
 }
@@ -38,6 +41,7 @@ impl ProviderManagement {
             registry,
             relation,
             channel_binding_cleanup: Arc::new(NoopChannelBindingCleanupPort),
+            bot_catalog_cleanup: Arc::new(NoopBotCatalogCleanupPort),
             user_directory: None,
             control_plane: None,
         }
@@ -49,6 +53,18 @@ impl ProviderManagement {
     ) -> Self {
         self.channel_binding_cleanup = channel_binding_cleanup;
         self
+    }
+
+    pub fn with_bot_catalog_cleanup(mut self, cleanup: Arc<dyn BotCatalogCleanupPort>) -> Self {
+        self.bot_catalog_cleanup = cleanup;
+        self
+    }
+
+    async fn cleanup_deleted_bot(&self, bot_uuid: &str) -> ServiceResult<()> {
+        self.channel_binding_cleanup
+            .delete_bindings_for_bot(bot_uuid)
+            .await?;
+        self.bot_catalog_cleanup.delete_bot(bot_uuid).await
     }
 
     pub fn with_user_directory(mut self, user_directory: Arc<dyn UserDirectoryPlugin>) -> Self {
@@ -380,7 +396,7 @@ impl ProviderManagementService for ProviderManagement {
         if let Some(result) = self.provider_bot_core.delete_registered_provider_bot(
             &command.provider_id, &command.provider_admin_token, &command.provider_bot_ref,
         ).await? {
-            self.channel_binding_cleanup.delete_bindings_for_bot(&result.bot_uuid).await?;
+            self.cleanup_deleted_bot(&result.bot_uuid).await?;
             return Ok(DeleteProviderBotOutcome {
                 bot_uuid: result.bot_uuid, provider_id: command.provider_id,
                 provider_bot_ref: command.provider_bot_ref, deleted: result.deleted,
@@ -391,7 +407,7 @@ impl ProviderManagementService for ProviderManagement {
             .provider_bot_core
             .get_provider_bot_binding_by_ref(&command.provider_id, &command.provider_bot_ref)
             .await?;
-        let bot_uuid = match binding {
+        let (bot_uuid, cleanup_before_soft_delete) = match binding {
             Some(binding) => {
                 was_active_binding = !binding.disabled;
                 if binding.provider_id != command.provider_id {
@@ -406,7 +422,7 @@ impl ProviderManagementService for ProviderManagement {
                         true,
                     )
                     .await?;
-                binding.bot_uuid
+                (binding.bot_uuid, false)
             }
             // Legacy bots on allowed-switch providers reuse provider_bot_ref as bot_uuid
             // and may have no binding row.
@@ -416,21 +432,25 @@ impl ProviderManagementService for ProviderManagement {
                 if self.registry.get(&command.provider_bot_ref).await.is_none() {
                     return Err(ServiceError::BotNotFound(command.provider_bot_ref));
                 }
-                command.provider_bot_ref.clone()
+                (command.provider_bot_ref.clone(), true)
             }
             None => {
                 return Err(ServiceError::BotNotFound(command.provider_bot_ref));
             }
         };
 
-        // Soft-delete the bot first so concurrent channel binding creation can no
-        // longer validate this bot as a target, then remove its channel bindings.
-        // Cleanup failure is returned as an error; re-deleting is idempotent for
-        // binding-backed bots because the provider binding row still resolves bot_uuid.
-        let deleted = self.registry.soft_delete(&bot_uuid).await || was_active_binding;
-        self.channel_binding_cleanup
-            .delete_bindings_for_bot(&bot_uuid)
-            .await?;
+        // Binding-backed bots can be tombstoned before cleanup because their
+        // binding retains the identity needed for retries. Unbound legacy bots
+        // have no such durable lookup key, so keep the registry identity active
+        // until cleanup succeeds and a failed request remains retryable.
+        let deleted = if cleanup_before_soft_delete {
+            self.cleanup_deleted_bot(&bot_uuid).await?;
+            self.registry.soft_delete(&bot_uuid).await
+        } else {
+            let deleted = self.registry.soft_delete(&bot_uuid).await || was_active_binding;
+            self.cleanup_deleted_bot(&bot_uuid).await?;
+            deleted
+        };
         Ok(DeleteProviderBotOutcome {
             bot_uuid,
             provider_id: command.provider_id,

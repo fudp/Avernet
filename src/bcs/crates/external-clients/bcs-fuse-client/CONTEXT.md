@@ -9,7 +9,7 @@
 ## Consumes
 
 - `bcs-config-api` for `BcsFuseConfig`.
-- HTTP endpoint, timeout, and profile settings supplied by bootstrap or service wiring.
+- HTTP endpoint, timeout, optional Bearer credential, and profile settings supplied by bootstrap or service wiring.
 
 ## Allowed dependencies
 
@@ -29,6 +29,11 @@
 ## Runtime ownership
 
 This crate owns BCSFuse transport concerns only. Business implementations that consume this client live in `services/bcs-fusion`.
+
+Worker lifecycle operations use the shared `/v1/workers/*` contract implemented
+by both the internal and open-source BCSFuse deployments. Missing-worker
+responses may use either the OSS `WORKER_NOT_FOUND` code or the internal
+`BCSFUSE-DOM-WORKER-NOT-FOUND` code.
 
 ## Tests
 

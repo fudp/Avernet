@@ -837,6 +837,23 @@ async def set_worker_availability(worker_id: str, request: Request, req: WorkerA
         )
 
 
+@compat_router.put(
+    "/workers/{worker_id}/availability",
+    summary="Set worker availability (backward-compatible)",
+    description="Update worker availability through the shared BCS lifecycle contract.",
+    response_model=WorkerAvailabilityResponse,
+    tags=["Workers"],
+    deprecated=True,
+)
+async def set_worker_availability_compat(
+    worker_id: str,
+    request: Request,
+    req: WorkerAvailabilityUpdate,
+):
+    """Backward-compatible alias for the BCS-facing /v1 contract."""
+    return await set_worker_availability(worker_id, request, req)
+
+
 @mgmt_router.put(
     "/workers/{worker_id}/trust-level",
     summary="Set worker trust level",
@@ -2515,17 +2532,16 @@ def _sync_availability_to_vector_store(worker_id: str, availability: str) -> Non
     Supports both Qdrant (native set_payload) and Faiss (direct metadata
     update via update_payload_by_worker).
 
-    Non-critical: errors are logged but do not fail the HTTP request.
+    Raises when the payload cannot be updated so lifecycle callers can retry
+    instead of treating stale discovery metadata as synchronized.
     """
     try:
         from src.interfaces.api.dependencies.fusion_dependencies import _get_vector_match_service
         service = _get_vector_match_service()
         if service is None or service._vector_store is None:
-            logger.warning(
-                "[AVAILABILITY-VECTORSYNC] vector_store not available, "
-                "skipping payload update for worker=%s", worker_id
+            raise RuntimeError(
+                f"vector_store not available for availability update: worker={worker_id}"
             )
-            return
 
         vector_store = service._vector_store
 
@@ -2590,10 +2606,11 @@ def _sync_availability_to_vector_store(worker_id: str, availability: str) -> Non
             "fragments_updated=%d", availability, worker_id, len(point_ids)
         )
     except Exception as e:
-        logger.warning(
+        logger.error(
             "[AVAILABILITY-VECTORSYNC] Failed to sync availability to vector store "
             "for worker=%s: %s", worker_id, e
         )
+        raise
 
 
 def _sync_runtime_state_to_vector_store(worker_id: str, runtime_state: str) -> None:
@@ -2884,7 +2901,7 @@ def include_r3_routes(app) -> None:
     Route categories:
     - api_router: External product APIs at /api/v1 (sync, availability — for 3rd-party callers)
     - mgmt_router: Management platform APIs at /v1 (trust-level, profiles, config reads — for admin portal)
-    - compat_router: Backward-compatible alias at /v1 (sync — deprecated, for existing callers like BCS)
+    - compat_router: Backward-compatible aliases at /v1 (sync and availability, for BCS)
     - admin_router: Privileged admin APIs at /v1/admin (only when BCSFUSE_EXPOSE_ADMIN=true)
 
     These routes MUST be mounted BEFORE skeleton routes to avoid shadowing.
