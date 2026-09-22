@@ -59,6 +59,7 @@ pub struct BotConnectionProtocol {
 
 #[derive(Debug, Default)]
 pub struct BotConnectionRegistry {
+    pub connection_epoch: crate::shared::connection_epoch::ConnectionEpoch,
     connections: RwLock<HashMap<String, BotConnection>>,
     pending_requests: RwLock<HashMap<String, oneshot::Sender<serde_json::Value>>>,
     pending_abort_requests: RwLock<HashMap<String, oneshot::Sender<ResponseFrame>>>,
