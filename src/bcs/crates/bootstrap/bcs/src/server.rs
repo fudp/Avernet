@@ -2231,6 +2231,7 @@ impl Default for BcsServerState {
         ));
         let bot_connections = Arc::new(BotConnectionRegistry::new());
         let mut bot_use_cases = Bot::new_with_friend(bot_registry.clone(), friend_store.clone())
+            .with_uplink_config(config.uplink.clone())
             .with_bot_core(bot_core_arc.clone())
             .with_organization(organization_core.clone())
             .with_relation(relation_store.clone() as Arc<dyn bcs_service_api::RelationCoreService>)
@@ -2983,6 +2984,7 @@ fn build_use_case_bundle(
     );
 
     let mut bot_use_cases = Bot::new_with_friend(bot_registry.clone(), friend.clone())
+        .with_uplink_config(config.uplink.clone())
         .with_bot_core(bot_core.clone())
         .with_control_plane(provider_control_plane.clone())
         .with_organization(organization_core.clone())
@@ -3854,6 +3856,7 @@ impl BcsServer {
         let (fusion, fuse_client) = create_fusion_service(&config);
         let bot_connections = Arc::new(BotConnectionRegistry::new());
         let mut bot_use_cases = Bot::new_with_friend(bot_registry.clone(), friend_store.clone())
+            .with_uplink_config(config.uplink.clone())
             .with_bot_core(bot_core_arc.clone())
             .with_organization(organization_core.clone())
             .with_relation(relation_store.clone() as Arc<dyn bcs_service_api::RelationCoreService>)
@@ -4657,6 +4660,7 @@ impl BcsServer {
         let bot_connections = Arc::new(BotConnectionRegistry::new());
         let mut bot_runtime_for_session =
             Bot::new_with_friend(bot_registry.clone(), friend_svc.clone())
+                .with_uplink_config(config.uplink.clone())
                 .with_bot_core(bot_core_arc.clone())
                 .with_organization(organization_core.clone())
                 .with_connection_control(

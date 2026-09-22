@@ -14,9 +14,12 @@ pub use bcs_domain::GROUP_ID_PREFIX;
 /// Current protocol version supported by this build.
 /// v1: Initial protocol. session_context as structured field, engine formats context header.
 /// v2: BCS prepends Group Context header to message content automatically.
-pub const BCS_PROTOCOL_VERSION: u32 = 2;
+/// v3: Bot uplink uses the canonical Provider Run Event contract.
+pub const BCS_PROTOCOL_VERSION: u32 = 3;
 /// Minimum protocol version still accepted.
 pub const BCS_MIN_SUPPORTED_VERSION: u32 = 1;
+/// Stable compatibility default for clients that predate explicit negotiation.
+pub const BCS_DEFAULT_PROTOCOL_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // Frame layer (mirrors OpenClaw frames.py)
@@ -240,7 +243,7 @@ pub struct BotConnectParams {
     pub bot_id: Option<String>,
 
     /// Protocol version requested by the client.
-    /// Omitted or None → server defaults to BCS_PROTOCOL_VERSION.
+    /// Omitted or None → server defaults to BCS_DEFAULT_PROTOCOL_VERSION.
     #[serde(default)]
     pub protocol_version: Option<u32>,
 
@@ -256,6 +259,25 @@ pub struct ProtocolDeprecation {
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sunset_date: Option<String>,
+}
+
+/// Capabilities negotiated for one Bot WebSocket connection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BotConnectCapabilities {
+    pub unified_run_events: bool,
+    pub tool_result_task_intent: bool,
+    pub canonical_session_id: bool,
+}
+
+impl BotConnectCapabilities {
+    pub fn for_connection(protocol_version: u32, tool_result_task_intent: bool) -> Self {
+        let unified_run_events = protocol_version >= 3;
+        Self {
+            unified_run_events,
+            tool_result_task_intent: unified_run_events && tool_result_task_intent,
+            canonical_session_id: unified_run_events,
+        }
+    }
 }
 
 fn default_protocol_version() -> u32 {
@@ -280,6 +302,9 @@ pub struct BotConnectResponse {
     /// Deprecation notice when the negotiated version is scheduled for removal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deprecation: Option<ProtocolDeprecation>,
+    /// Features enabled for this negotiated connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<BotConnectCapabilities>,
     /// Environment variables the engine should set for child processes (e.g., bcs-cli).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<HashMap<String, String>>,
@@ -932,6 +957,17 @@ fn delivery_session_key(
     build_session_key(wire_id)
 }
 
+/// Materialize the canonical V3 session id even for group-scoped deliveries
+/// that do not carry a distinct session. Legacy protocols keep the optional
+/// value so their wire group-id substitution remains unchanged.
+fn delivery_bcs_session_id<'a>(
+    group_id: &'a str,
+    bcs_session_id: Option<&'a str>,
+    supports_session_field: bool,
+) -> Option<&'a str> {
+    supports_session_field.then(|| bcs_session_id.unwrap_or(group_id))
+}
+
 fn canonical_generated_group_id(rest: &str) -> Option<&str> {
     let group_id = rest.split_once(':').map_or(rest, |(group_id, _)| group_id);
     let token = group_id
@@ -988,7 +1024,8 @@ pub fn build_chat_inject_frame(
     );
     let supports_session_field = protocol_version >= 3;
     let wire_id = legacy_aware_wire_group_id(session_id, bcs_session_id, supports_session_field);
-    let session_key = delivery_session_key(wire_id, bcs_session_id, supports_session_field);
+    let wire_session_id = delivery_bcs_session_id(session_id, bcs_session_id, supports_session_field);
+    let session_key = delivery_session_key(wire_id, wire_session_id, supports_session_field);
     let inject = ChatInjectParams {
         session_key,
         bcs_group_id: wire_id.to_string(),
@@ -1006,11 +1043,7 @@ pub fn build_chat_inject_frame(
             identity_forwarding: None,
         },
         session_context: group_context,
-        bcs_session_id: if supports_session_field {
-            bcs_session_id.map(str::to_string)
-        } else {
-            None
-        },
+        bcs_session_id: wire_session_id.map(str::to_string),
         tags: tags.to_vec(),
         attachments: attachments.clone().unwrap_or_default(),
     };
@@ -1071,7 +1104,8 @@ pub fn build_chat_send_frame(
     // bcs_group_id for backward compat (old BCN plugins key on it).
     let supports_session_field = protocol_version >= 3;
     let wire_id = legacy_aware_wire_group_id(session_id, bcs_session_id, supports_session_field);
-    let session_key = delivery_session_key(wire_id, bcs_session_id, supports_session_field);
+    let wire_session_id = delivery_bcs_session_id(session_id, bcs_session_id, supports_session_field);
+    let session_key = delivery_session_key(wire_id, wire_session_id, supports_session_field);
     let send = ChatSendParams {
         session_key,
         bcs_group_id: wire_id.to_string(),
@@ -1091,11 +1125,7 @@ pub fn build_chat_send_frame(
         session_context: group_context,
         timeout_ms: None,
         idempotency_key: Some(run_id.to_string()),
-        bcs_session_id: if supports_session_field {
-            bcs_session_id.map(str::to_string)
-        } else {
-            None
-        },
+        bcs_session_id: wire_session_id.map(str::to_string),
         tags: tags.to_vec(),
         attachments: attachments.clone().unwrap_or_default(),
     };
@@ -1145,7 +1175,8 @@ pub fn build_direct_chat_send_frame(
     );
     let supports_session_field = protocol_version >= 3;
     let wire_id = legacy_aware_wire_group_id(session_id, bcs_session_id, supports_session_field);
-    let session_key = delivery_session_key(wire_id, bcs_session_id, supports_session_field);
+    let wire_session_id = delivery_bcs_session_id(session_id, bcs_session_id, supports_session_field);
+    let session_key = delivery_session_key(wire_id, wire_session_id, supports_session_field);
     let send = ChatSendParams {
         session_key,
         bcs_group_id: wire_id.to_string(),
@@ -1165,11 +1196,7 @@ pub fn build_direct_chat_send_frame(
         session_context: group_context,
         timeout_ms: None,
         idempotency_key: Some(run_id.to_string()),
-        bcs_session_id: if supports_session_field {
-            bcs_session_id.map(str::to_string)
-        } else {
-            None
-        },
+        bcs_session_id: wire_session_id.map(str::to_string),
         tags: tags.to_vec(),
         attachments: attachments.clone().unwrap_or_default(),
     };
@@ -1215,7 +1242,8 @@ pub fn build_direct_chat_inject_frame(
     );
     let supports_session_field = protocol_version >= 3;
     let wire_id = legacy_aware_wire_group_id(session_id, bcs_session_id, supports_session_field);
-    let session_key = delivery_session_key(wire_id, bcs_session_id, supports_session_field);
+    let wire_session_id = delivery_bcs_session_id(session_id, bcs_session_id, supports_session_field);
+    let session_key = delivery_session_key(wire_id, wire_session_id, supports_session_field);
     let inject = ChatInjectParams {
         session_key,
         bcs_group_id: wire_id.to_string(),
@@ -1233,11 +1261,7 @@ pub fn build_direct_chat_inject_frame(
             identity_forwarding: None,
         },
         session_context: group_context,
-        bcs_session_id: if supports_session_field {
-            bcs_session_id.map(str::to_string)
-        } else {
-            None
-        },
+        bcs_session_id: wire_session_id.map(str::to_string),
         tags: tags.to_vec(),
         attachments: attachments.clone().unwrap_or_default(),
     };
@@ -2271,7 +2295,7 @@ mod tests {
     }
 
     #[test]
-    fn build_chat_send_frame_without_bcs_session_id() {
+    fn build_chat_send_frame_v3_falls_back_to_group_id_for_session() {
         let ctx = test_group_context_input();
         let frame = build_chat_send_frame(
             "r1",
@@ -2295,7 +2319,39 @@ mod tests {
             BcsFrame::Request(req) => {
                 let p: ChatSendParams = serde_json::from_value(req.params.unwrap()).unwrap();
                 assert_eq!(p.bcs_group_id, "grp-test");
-                assert_eq!(p.bcs_session_id, None);
+                assert_eq!(p.bcs_session_id.as_deref(), Some("grp-test"));
+                assert_eq!(p.session_key, "grp-test");
+            }
+            _ => panic!("expected Request frame"),
+        }
+    }
+
+    #[test]
+    fn build_chat_inject_frame_v3_falls_back_to_group_id_for_session() {
+        let ctx = test_group_context_input();
+        let frame = build_chat_inject_frame(
+            "r1",
+            "grp-test",
+            &ctx,
+            "hello",
+            "b1",
+            "Bot1",
+            &[],
+            "target",
+            &[],
+            &None,
+            false,
+            3,
+            None,
+            None,
+            None,
+        );
+        match frame {
+            BcsFrame::Request(req) => {
+                let p: ChatInjectParams = serde_json::from_value(req.params.unwrap()).unwrap();
+                assert_eq!(p.bcs_group_id, "grp-test");
+                assert_eq!(p.bcs_session_id.as_deref(), Some("grp-test"));
+                assert_eq!(p.session_key, "grp-test");
             }
             _ => panic!("expected Request frame"),
         }

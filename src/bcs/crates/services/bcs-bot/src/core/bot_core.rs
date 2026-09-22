@@ -240,6 +240,10 @@ impl BotRegistryCoreService for BotCore {
         self.repo.add_bot_info(bot_id, key, value).await;
     }
 
+    async fn set_bot_info(&self, bot_id: &str, key: &str, value: Option<String>) {
+        self.repo.set_bot_info(bot_id, key, value).await;
+    }
+
     async fn get_bot_info(&self, bot_id: &str, key: &str) -> Option<String> {
         self.repo.get_bot_info(bot_id, key).await
     }
@@ -388,8 +392,13 @@ impl BotRegistryCoreService for BotCore {
             .get_bot_info(bot_id, "client_kind")
             .await
             .map(|value| value.trim().to_ascii_lowercase());
-        if client_kind.as_deref() == Some("plugin") {
-            return Ok(CoordinationSurface::native_tool());
+        match client_kind.as_deref() {
+            Some("native_mcp") => return Ok(CoordinationSurface::native_mcp_bcs()),
+            Some("mcporter_mcp") => return Ok(CoordinationSurface::mcporter_mcp_bcs()),
+            Some("native_tool" | "plugin" | "openclaw-channel-bcn" | "deepseek-harness-channel-bcn") => {
+                return Ok(CoordinationSurface::native_tool());
+            }
+            _ => {}
         }
 
         Ok(CoordinationSurface::legacy_upstream())

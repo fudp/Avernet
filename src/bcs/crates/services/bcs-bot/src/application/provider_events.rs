@@ -15,7 +15,8 @@ use bcs_service_api::{
     DEFAULT_PROVIDER_CALLBACK_TIMEOUT_MS,
 };
 use bcs_protocol::stream::{
-    ProviderTextEventState, ProviderTextResponseMode, apply_provider_event_text,
+    ProviderTextEventState, ProviderTextResponseMode, TASK_INTENT_ELIGIBLE_KEY,
+    apply_provider_event_text,
 };
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -371,6 +372,7 @@ impl ProviderBotEventService for ProviderBotEvents {
         if ingest_event_type == "chat.event" {
             normalize_chat_error_payload(&mut ingest_payload);
         }
+        stamp_provider_task_intent_candidate(&ingest_event_type, &mut ingest_payload);
 
         if let Some(runtime) = self.collaboration_runtime.as_ref()
             && runtime.lookup_delivery_correlation(&command.run_id).await
@@ -684,6 +686,28 @@ impl ProviderBotEventService for ProviderBotEvents {
     }
 }
 
+fn stamp_provider_task_intent_candidate(event_type: &str, payload: &mut Value) {
+    let Some(object) = payload.as_object_mut() else {
+        return;
+    };
+    object.remove(TASK_INTENT_ELIGIBLE_KEY);
+    let eligible = event_type == "agent"
+        && object.get("stream").and_then(Value::as_str) == Some("tool")
+        && object
+            .get("data")
+            .and_then(|data| data.get("phase"))
+            .and_then(Value::as_str)
+            == Some("result")
+        && object
+            .get("data")
+            .and_then(|data| data.get("isError"))
+            .and_then(Value::as_bool)
+            == Some(false);
+    if eligible {
+        object.insert(TASK_INTENT_ELIGIBLE_KEY.to_string(), Value::Bool(true));
+    }
+}
+
 fn normalize_chat_error_payload(payload: &mut Value) {
     let Some(obj) = payload.as_object_mut() else {
         return;
@@ -796,6 +820,36 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_task_intent_candidate_requires_explicit_success() {
+        for (is_error, eligible) in [
+            (Some(Value::Bool(false)), true),
+            (Some(Value::Bool(true)), false),
+            (Some(Value::String("false".to_string())), false),
+            (None, false),
+        ] {
+            let mut payload = json!({
+                "stream": "tool",
+                "data": {
+                    "phase": "result",
+                    "name": "mcp__bcs__bcs_assign_task",
+                    "toolCallId": "call-1",
+                    "result": "ok"
+                }
+            });
+            if let Some(is_error) = is_error {
+                payload["data"]["isError"] = is_error;
+            }
+
+            stamp_provider_task_intent_candidate("agent", &mut payload);
+
+            assert_eq!(
+                payload.get(TASK_INTENT_ELIGIBLE_KEY).and_then(Value::as_bool),
+                eligible.then_some(true)
+            );
+        }
+    }
 
     #[test]
     fn state_machine_visible_text_expires_one_day_after_run_deadline() {

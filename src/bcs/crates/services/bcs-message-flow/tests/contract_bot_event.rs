@@ -8,7 +8,7 @@ use std::sync::Arc;
 use bcs_domain::{MessageAudience, MessageVisibilityDomain};
 use bcs_message_flow::{BcsMessageFlow, MemoryBotRunContextStore};
 use bcs_message_flow::task_store::{new_task_entry, TaskLedgerStatus, TASK_TTL_MS};
-use bcs_protocol::BcsFrame;
+use bcs_protocol::{BcsFrame, stream::TASK_INTENT_ELIGIBLE_KEY};
 use bcs_service_api::{
     ActorKind, BotDeliveryKind, BotDeliveryTarget, BotEventCommand, BotRegistryCoreService,
     BotRunContextPort, BotTerminalEvent, BotTerminalObserverPort, BotTerminalState,
@@ -2704,12 +2704,23 @@ async fn agent_tool_result_coordination_echo_dispatches_task() {
     })
     .to_string();
 
+    record_matching_tool_start(
+        &flow,
+        "bot-driver",
+        "manager-run",
+        "group-1",
+        "group-1:abcdef12",
+        "Bash",
+        "tool-1",
+    )
+    .await;
     flow.handle_bot_event(BotEventCommand {
         bot_id: "bot-driver".to_string(),
         run_id: "manager-run".to_string(),
         group_id: "group-1".to_string(),
         event_type: "agent".to_string(),
         event_payload: json!({
+            TASK_INTENT_ELIGIBLE_KEY: true,
             "stream": "tool",
             "data": {
                 "phase": "result",
@@ -2736,6 +2747,78 @@ async fn agent_tool_result_coordination_echo_dispatches_task() {
 }
 
 #[tokio::test]
+async fn agent_tool_result_coordination_requires_explicit_success() {
+    let support = support::FlowTestSupport::new_group_with_driver_and_observer().await;
+    let mut group = support.group.get("group-1").await.unwrap();
+    group.service_mode = Some("master_slave".to_string());
+    support.group.upsert(group).await.unwrap();
+    let flow = BcsMessageFlow::new(
+        support.group.clone(),
+        support.routing.clone(),
+        support.registry.clone(),
+        support.bot_delivery.clone(),
+        support.frontend_delivery.clone(),
+    );
+    let echo = coordination_echo(
+        "bcs_assign_task",
+        json!({
+            "target_bot": "bot-observer",
+            "message": "must not dispatch",
+        }),
+    );
+
+    for (index, is_error) in [
+        None,
+        Some(Value::String("false".to_string())),
+        Some(Value::Bool(true)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let run_id = format!("failed-tool-run-{index}");
+        let tool_call_id = format!("failed-tool-{index}");
+        record_matching_tool_start(
+            &flow,
+            "bot-driver",
+            &run_id,
+            "group-1",
+            "group-1:abcdef12",
+            "Bash",
+            &tool_call_id,
+        )
+        .await;
+        let mut event_payload = agent_tool_result_payload(
+            Some("Bash"),
+            &tool_call_id,
+            &echo,
+            false,
+        );
+        match is_error {
+            Some(value) => event_payload["data"]["isError"] = value,
+            None => {
+                event_payload["data"]
+                    .as_object_mut()
+                    .expect("tool result data")
+                    .remove("isError");
+            }
+        }
+        flow.handle_bot_event(BotEventCommand {
+            bot_id: "bot-driver".to_string(),
+            run_id,
+            group_id: "group-1".to_string(),
+            event_type: "agent".to_string(),
+            event_payload,
+            state: ChatEventState::Delta,
+            bcs_session_id: Some("group-1:abcdef12".to_string()),
+        })
+        .await
+        .unwrap();
+    }
+
+    assert!(support.bot_delivery.kinds().await.is_empty());
+}
+
+#[tokio::test]
 async fn duplicate_agent_tool_result_coordination_echo_dispatches_once() {
     let support = support::FlowTestSupport::new_group_with_driver_and_observer().await;
     let mut group = support.group.get("group-1").await.unwrap();
@@ -2755,7 +2838,17 @@ async fn duplicate_agent_tool_result_coordination_echo_dispatches_once() {
             "message": "review this file",
         }),
     );
-    let event_payload = agent_tool_result_payload(None, "tool-dup", &echo, false);
+    record_matching_tool_start(
+        &flow,
+        "bot-driver",
+        "manager-run",
+        "group-1",
+        "group-1:abcdef12",
+        "Bash",
+        "tool-dup",
+    )
+    .await;
+    let event_payload = agent_tool_result_payload(Some("Bash"), "tool-dup", &echo, false);
 
     for _ in 0..2 {
         flow.handle_bot_event(BotEventCommand {
@@ -2795,6 +2888,16 @@ async fn agent_tool_result_coordination_echo_rejects_unsupported_tool_name() {
         }),
     );
 
+    record_matching_tool_start(
+        &flow,
+        "bot-driver",
+        "manager-run",
+        "group-1",
+        "group-1:abcdef12",
+        "read_file",
+        "tool-read",
+    )
+    .await;
     flow.handle_bot_event(BotEventCommand {
         bot_id: "bot-driver".to_string(),
         run_id: "manager-run".to_string(),
@@ -2847,6 +2950,16 @@ async fn native_mcp_tool_result_coordination_echo_dispatches_from_exact_provider
         }),
     );
 
+    record_matching_tool_start(
+        &flow,
+        "bot-driver",
+        "native-manager-run",
+        "group-1",
+        "group-1:abcdef12",
+        "mcp_mcp.ant.agentclawscs.bcs_mcp_bcs_assign_task",
+        "native-tool-1",
+    )
+    .await;
     flow.handle_bot_event(BotEventCommand {
         bot_id: "bot-driver".to_string(),
         run_id: "native-manager-run".to_string(),
@@ -2902,6 +3015,16 @@ async fn native_mcp_assign_task_echo_forwards_provider_participant_tags() {
         }),
     );
 
+    record_matching_tool_start(
+        &flow,
+        "bot-manager",
+        "native-manager-provider-run",
+        "group-1",
+        "group-1:abcdef12",
+        "mcp_mcp.ant.agentclawscs.bcs_mcp_bcs_assign_task",
+        "native-provider-tool-1",
+    )
+    .await;
     flow.handle_bot_event(BotEventCommand {
         bot_id: "bot-manager".to_string(),
         run_id: "native-manager-provider-run".to_string(),
@@ -2966,6 +3089,18 @@ async fn native_mcp_coordination_rejects_unmapped_or_mismatched_results_and_reso
                 "message": "must not dispatch",
             }),
         );
+        if let Some(tool_name) = tool_name {
+            record_matching_tool_start(
+                &flow,
+                "bot-driver",
+                "native-rejected-run",
+                "group-1",
+                "group-1:abcdef12",
+                tool_name,
+                tool_call_id,
+            )
+            .await;
+        }
         flow.handle_bot_event(BotEventCommand {
             bot_id: "bot-driver".to_string(),
             run_id: "native-rejected-run".to_string(),
@@ -3050,6 +3185,16 @@ async fn coordination_surface_resolution_failure_is_cached_and_fails_closed() {
     );
 
     for tool_call_id in ["unknown-bot-tool-1", "unknown-bot-tool-2"] {
+        record_matching_tool_start(
+            &flow,
+            "unknown-bot",
+            "unknown-bot-run",
+            "group-1",
+            "group-1:abcdef12",
+            "Bash",
+            tool_call_id,
+        )
+        .await;
         flow.handle_bot_event(BotEventCommand {
             bot_id: "unknown-bot".to_string(),
             run_id: "unknown-bot-run".to_string(),
@@ -4969,9 +5114,40 @@ fn agent_tool_result_payload(
         data["name"] = Value::String(tool_name.to_string());
     }
     json!({
+        TASK_INTENT_ELIGIBLE_KEY: true,
         "stream": "tool",
         "data": data,
     })
+}
+
+async fn record_matching_tool_start(
+    flow: &BcsMessageFlow,
+    bot_id: &str,
+    run_id: &str,
+    group_id: &str,
+    session_id: &str,
+    tool_name: &str,
+    tool_call_id: &str,
+) {
+    flow.handle_bot_event(BotEventCommand {
+        bot_id: bot_id.to_string(),
+        run_id: run_id.to_string(),
+        group_id: group_id.to_string(),
+        event_type: "agent".to_string(),
+        event_payload: json!({
+            "stream": "tool",
+            "data": {
+                "phase": "start",
+                "toolCallId": tool_call_id,
+                "name": tool_name,
+                "args": {},
+            },
+        }),
+        state: ChatEventState::Delta,
+        bcs_session_id: Some(session_id.to_string()),
+    })
+    .await
+    .expect("matching V3 tool start should be accepted");
 }
 
 fn test_session(id: &str, group_id: &str, kind: SessionKind) -> Session {

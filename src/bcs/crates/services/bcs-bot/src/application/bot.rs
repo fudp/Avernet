@@ -37,6 +37,7 @@ pub struct Bot {
     user_directory: Option<Arc<dyn UserDirectoryPlugin>>,
     connection_control: Option<Arc<dyn BotConnectionControlPort>>,
     organization: Option<Arc<dyn OrganizationCoreService>>,
+    uplink: bcs_config_api::UplinkConfig,
 }
 
 impl Bot {
@@ -58,7 +59,14 @@ impl Bot {
             user_directory: None,
             connection_control: None,
             organization: None,
+            uplink: Default::default(),
         }
+    }
+
+    /// Inject deployment authorization; profile selection is never persisted per Bot.
+    pub fn with_uplink_config(mut self, uplink: bcs_config_api::UplinkConfig) -> Self {
+        self.uplink = uplink;
+        self
     }
 
     /// Wire the concrete `BotCore` so use cases that need provider-bindings
@@ -839,11 +847,17 @@ impl BotRuntimeConnectionService for Bot {
             self.validate_connect_bot_id(bot_id).await?;
         }
 
+        let requested_client_kind = client_kind
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase());
+
         let params = BotConnectParams {
             token,
             bot_id,
             protocol_version,
-            client_kind: client_kind.clone(),
+            client_kind: None,
         };
         let result = self
             .registry
@@ -856,17 +870,18 @@ impl BotRuntimeConnectionService for Bot {
                 .set_protocol_version(&result.bot_uuid, version)
                 .await;
         }
-        if let Some(client_kind) = client_kind
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            self.registry
-                .add_bot_info(&result.bot_uuid, "client_kind", client_kind.to_string())
-                .await;
-        }
+        let negotiated_client_kind = self.uplink.negotiate(protocol_version, requested_client_kind);
+        self.registry
+            .set_bot_info(
+                &result.bot_uuid,
+                "client_kind",
+                negotiated_client_kind.clone(),
+            )
+            .await;
 
-        Ok(BotRuntimeConnectOutcome::from_connect_result(result))
+        let mut outcome = BotRuntimeConnectOutcome::from_connect_result(result);
+        outcome.negotiated_client_kind = negotiated_client_kind;
+        Ok(outcome)
     }
 
     async fn update_runtime_status(
@@ -898,6 +913,12 @@ impl BotRuntimeConnectionService for Bot {
         &self,
         command: BotRuntimeDisconnectCommand,
     ) -> Result<(), BotUseCaseError> {
+        // Clear the active profile before releasing the streaming slot. Once
+        // the slot is released a reconnect may negotiate a new profile, which
+        // an older connection's cleanup must never erase.
+        self.registry
+            .set_bot_info(&command.bot_id, "client_kind", None)
+            .await;
         self.registry.disconnect_streaming(&command.bot_id).await;
         Ok(())
     }

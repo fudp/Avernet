@@ -375,6 +375,7 @@ pub(super) async fn cache_tool_start(flow: &BcsMessageFlow, cmd: &BotEventComman
         .cache_tool_call_start(
             tool_call_id.to_string(),
             crate::message_tracker::ToolCallStartInfo {
+                bot_id: cmd.bot_id.clone(),
                 run_id: cmd.run_id.clone(),
                 session_id,
                 name,
@@ -383,6 +384,40 @@ pub(super) async fn cache_tool_start(flow: &BcsMessageFlow, cmd: &BotEventComman
             },
         )
         .await;
+}
+
+pub(super) async fn tool_result_matches_start(
+    flow: &BcsMessageFlow,
+    cmd: &BotEventCommand,
+    data: &Value,
+) -> bool {
+    let Some(tool_call_id) = data
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let Some(result_name) = data
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let Some(start) = flow
+        .message_tracker
+        .get_tool_call_start(&cmd.run_id, tool_call_id)
+        .await
+    else {
+        return false;
+    };
+    start.bot_id == cmd.bot_id
+        && start.run_id == cmd.run_id
+        && start.session_id == cmd.bcs_session_id.as_deref().unwrap_or_default()
+        && start.name == result_name
 }
 
 pub(super) async fn persist_tool_result(
@@ -409,7 +444,10 @@ pub(super) async fn persist_tool_result(
         .unwrap_or(false);
     let result = data.get("result").cloned().unwrap_or(Value::Null);
 
-    let start_info = flow.message_tracker.get_tool_call_start(tool_call_id).await;
+    let start_info = flow
+        .message_tracker
+        .get_tool_call_start(&cmd.run_id, tool_call_id)
+        .await;
     let (args, run_id, session_id, start_name) = match start_info {
         Some(ref info) => (
             info.args.clone(),
@@ -463,7 +501,7 @@ pub(super) async fn persist_tool_result(
     )
     .await?;
     flow.message_tracker
-        .remove_tool_call_start(tool_call_id)
+        .remove_tool_call_start(&cmd.run_id, tool_call_id)
         .await;
     Ok(())
 }

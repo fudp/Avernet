@@ -134,7 +134,7 @@ async fn assert_sse_final_without_timestamp_in_history(include_deltas: bool) {
     let bots_dir = create_temp_bots_dir();
     let (bcs_addr, _bcs_server) = start_test_server(&bots_dir.path().to_path_buf()).await;
     let client = reqwest::Client::new();
-    let mut driver = MockBot::connect(bcs_addr).await;
+    let mut driver = MockBot::connect_v3(bcs_addr).await;
     driver.register("Driver", &["drive"], bcs_addr).await;
     let registered = register_provider_bot_with_protocol(
         &client, bcs_addr, provider.url(), "timestamp-provider", "timestamp-bot", "2.0",
@@ -161,9 +161,10 @@ async fn assert_sse_final_without_timestamp_in_history(include_deltas: bool) {
     assert_eq!(chat_send.body["session_id"], session_id);
     let frame = wait_for_bot_frame_containing(&mut driver, answer).await;
     assert_eq!(frame["method"], "chat.send");
-    // This mock speaks the legacy WS version, which carries the session in
-    // bcs_group_id; Provider HTTP above uses the explicit session_id field.
-    assert_eq!(frame["params"]["bcs_group_id"], session_id);
+    // Explicitly negotiated WebSocket V3 keeps group and session scopes
+    // separate on the relayed frame.
+    assert_eq!(frame["params"]["bcs_group_id"], group_id);
+    assert_eq!(frame["params"]["bcs_session_id"], session_id);
 
     // A Human history view reads public messages, so the Provider's private
     // context copy cannot hide a regression in final relay/persistence.
@@ -332,7 +333,7 @@ async fn system_message_provider_chat_send_final_callback_is_processed() {
     let (bcs_addr, _bcs_server, state) =
         start_test_server_with_state(&bots_dir.path().to_path_buf()).await;
     let client = reqwest::Client::new();
-    let mut driver = MockBot::connect(bcs_addr).await;
+    let mut driver = MockBot::connect_v3(bcs_addr).await;
     driver.register("Driver", &["drive"], bcs_addr).await;
     let registered = register_provider_bot(
         &client,
@@ -425,7 +426,11 @@ async fn system_message_provider_chat_send_final_callback_is_processed() {
     let frame =
         wait_for_bot_frame_containing(&mut driver, "provider replied to system message").await;
     assert_eq!(frame["method"], "chat.send");
-    assert_eq!(frame["params"]["bcs_group_id"], "session-system-message");
+    assert_eq!(frame["params"]["bcs_group_id"], group_id);
+    assert_eq!(
+        frame["params"]["bcs_session_id"],
+        "session-system-message"
+    );
 }
 
 #[tokio::test]

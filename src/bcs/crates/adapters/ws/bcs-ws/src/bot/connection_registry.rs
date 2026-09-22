@@ -21,11 +21,40 @@ fn is_unknown_method_code(code: &str) -> bool {
     .any(|candidate| code.eq_ignore_ascii_case(candidate))
 }
 
+pub(crate) fn normalize_client_kind(client_kind: Option<String>) -> Option<String> {
+    client_kind
+        .map(|kind| kind.trim().to_string())
+        .filter(|kind| !kind.is_empty())
+        .map(|kind| {
+            if kind.eq_ignore_ascii_case("native_mcp") {
+                "native_mcp".to_string()
+            } else {
+                kind
+            }
+        })
+}
+
 #[derive(Debug)]
 struct BotConnection {
     tx: mpsc::Sender<String>,
     identity: String,
     token_expires_at: Option<u64>,
+    protocol_version: u32,
+    client_kind: Option<String>,
+    run_sequences: HashMap<String, RunSequenceState>,
+}
+
+#[derive(Debug, Default)]
+struct RunSequenceState {
+    committed_seq: Option<u64>,
+    pending_seq: Option<u64>,
+    terminal_fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotConnectionProtocol {
+    pub protocol_version: u32,
+    pub client_kind: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -41,14 +70,115 @@ impl BotConnectionRegistry {
     }
 
     pub async fn connect(&self, bot_id: String, tx: mpsc::Sender<String>) {
+        self.connect_with_protocol(bot_id, tx, 1, None).await;
+    }
+
+    pub async fn connect_with_protocol(
+        &self,
+        bot_id: String,
+        tx: mpsc::Sender<String>,
+        protocol_version: u32,
+        client_kind: Option<String>,
+    ) {
+        let client_kind = normalize_client_kind(client_kind);
         self.connections.write().await.insert(
             bot_id,
             BotConnection {
                 tx,
                 identity: uuid::Uuid::new_v4().to_string(),
                 token_expires_at: None,
+                protocol_version,
+                client_kind,
+                run_sequences: HashMap::new(),
             },
         );
+    }
+
+    pub async fn protocol(&self, bot_id: &str) -> Option<BotConnectionProtocol> {
+        self.connections.read().await.get(bot_id).map(|connection| {
+            BotConnectionProtocol {
+                protocol_version: connection.protocol_version,
+                client_kind: connection.client_kind.clone(),
+            }
+        })
+    }
+
+    /// Reserve a strictly increasing V3 sequence number for one run.
+    ///
+    /// The reservation is committed only after business processing succeeds;
+    /// callers must release it on failure so the same frame can be retried.
+    pub async fn reserve_run_event_seq(&self, bot_id: &str, run_id: &str, seq: u64) -> bool {
+        let mut connections = self.connections.write().await;
+        let Some(connection) = connections.get_mut(bot_id) else {
+            return false;
+        };
+        let state = connection
+            .run_sequences
+            .entry(run_id.to_string())
+            .or_default();
+        if state.pending_seq.is_some()
+            || state.committed_seq.is_some_and(|previous| seq <= previous)
+        {
+            return false;
+        }
+        state.pending_seq = Some(seq);
+        true
+    }
+
+    pub async fn commit_run_event_seq(
+        &self,
+        bot_id: &str,
+        run_id: &str,
+        seq: u64,
+        terminal_fingerprint: Option<String>,
+    ) -> bool {
+        let mut connections = self.connections.write().await;
+        let Some(state) = connections
+            .get_mut(bot_id)
+            .and_then(|connection| connection.run_sequences.get_mut(run_id))
+        else {
+            return false;
+        };
+        if state.pending_seq != Some(seq) {
+            return false;
+        }
+        state.pending_seq = None;
+        state.committed_seq = Some(seq);
+        if terminal_fingerprint.is_some() {
+            state.terminal_fingerprint = terminal_fingerprint;
+        }
+        true
+    }
+
+    pub async fn release_run_event_seq(&self, bot_id: &str, run_id: &str, seq: u64) {
+        let mut connections = self.connections.write().await;
+        let Some(state) = connections
+            .get_mut(bot_id)
+            .and_then(|connection| connection.run_sequences.get_mut(run_id))
+        else {
+            return;
+        };
+        if state.pending_seq == Some(seq) {
+            state.pending_seq = None;
+        }
+    }
+
+    pub async fn is_terminal_replay(
+        &self,
+        bot_id: &str,
+        run_id: &str,
+        seq: u64,
+        fingerprint: &str,
+    ) -> bool {
+        self.connections
+            .read()
+            .await
+            .get(bot_id)
+            .and_then(|connection| connection.run_sequences.get(run_id))
+            .is_some_and(|state| {
+                state.committed_seq == Some(seq)
+                    && state.terminal_fingerprint.as_deref() == Some(fingerprint)
+            })
     }
 
     pub async fn disconnect(&self, bot_id: &str) {

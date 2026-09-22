@@ -153,6 +153,11 @@ struct RegisteredBotInner {
     capabilities: BotCapabilities,
     /// Active streaming connection (if connected).
     ws_connection: Option<BotConnection>,
+    /// Protocol version negotiated for the active streaming connection.
+    ///
+    /// This is process-local connection state and is intentionally not
+    /// persisted with the bot registration.
+    protocol_version: u32,
     /// Session token (persisted in database).
     session_token: Option<String>,
     /// Server environment (prod, gray, pre, dev).
@@ -234,7 +239,8 @@ pub struct PersistentBotRepo {
     token_to_bot: RwLock<HashMap<String, String>>,
     /// Channel binding index: (channel, binding_key) -> bot_uuid.
     binding_channel_index: Arc<RwLock<HashMap<(String, String), String>>>,
-    /// Process-local runtime info, e.g. client_kind from bot.connect.
+    /// Process-local runtime info, including the active negotiated client kind
+    /// and server-owned coordination profile.
     bot_info_overrides: RwLock<HashMap<(String, String), String>>,
 
     // Layer 2: Database
@@ -1225,6 +1231,7 @@ impl BotRepoPort for PersistentBotRepo {
                     last_heartbeat: Instant::now(),
                     capabilities: caps,
                     ws_connection: None,
+                    protocol_version: 1,
                     session_token: None,
                     env: Some(resolve_env()),
                     hidden: false,
@@ -1347,6 +1354,7 @@ impl BotRepoPort for PersistentBotRepo {
                         last_heartbeat: Instant::now(),
                         capabilities: caps,
                         ws_connection: None,
+                        protocol_version: 1,
                         session_token: Some(token.to_string()),
                         env: Some(resolve_env()),
                         hidden: false,
@@ -1508,9 +1516,8 @@ impl BotRepoPort for PersistentBotRepo {
     }
 
     async fn add_bot_info(&self, bot_id: &str, key: &str, value: String) {
-        // 目前仅支持 "agent_token"（复用 capabilities.agent_token 存储，仅内存）。
-        // 后期需要其他字段时，应在 RegisteredBotInner 上新增一个 HashMap 内存对象
-        // 来承载任意 key/value，而不是继续往 capabilities 上加字段。
+        // Agent credentials reuse capabilities; negotiated runtime metadata stays
+        // in the dedicated process-local override map.
         if key != "agent_token" && key != "client_kind" {
             tracing::warn!(request_id = %bcs_observability::CurrentRequestId, bot_id = %bot_id, key = %key, "add_bot_info: unrecognized key, ignoring");
             return;
@@ -1549,6 +1556,19 @@ impl BotRepoPort for PersistentBotRepo {
                 .and_then(|bot| bot.capabilities.agent_token.clone());
         }
         None
+    }
+
+    async fn set_bot_info(&self, bot_id: &str, key: &str, value: Option<String>) {
+        if let Some(value) = value {
+            self.add_bot_info(bot_id, key, value).await;
+            return;
+        }
+        if key == "client_kind" {
+            self.bot_info_overrides
+                .write()
+                .await
+                .remove(&(bot_id.to_string(), key.to_string()));
+        }
     }
 
     async fn list_active(&self) -> Vec<RegisteredBot> {
@@ -2410,6 +2430,7 @@ impl BotRepoPort for PersistentBotRepo {
                             session_token: session_token.clone(),
                             connected_at: Instant::now(),
                         }),
+                        protocol_version: 1,
                         session_token: Some(session_token.clone()),
                         env: Some(resolve_env()),
                         hidden: false,
@@ -2470,6 +2491,7 @@ impl BotRepoPort for PersistentBotRepo {
                                 session_token: session_token.clone(),
                                 connected_at: Instant::now(),
                             }),
+                            protocol_version: 1,
                             session_token: Some(session_token.clone()),
                             env: Some(resolve_env()),
                             hidden: false,
@@ -2553,6 +2575,7 @@ impl BotRepoPort for PersistentBotRepo {
                         session_token: session_token.clone(),
                         connected_at: Instant::now(),
                     }),
+                    protocol_version: 1,
                     session_token: Some(session_token.clone()),
                     env: Some(resolve_env()),
                     hidden: false,
@@ -2632,6 +2655,7 @@ impl BotRepoPort for PersistentBotRepo {
                         session_token: existing_token.clone(),
                         connected_at: Instant::now(),
                     }),
+                    protocol_version: 1,
                     session_token: Some(existing_token.clone()),
                     env,
                     hidden: false,
@@ -2696,6 +2720,20 @@ impl BotRepoPort for PersistentBotRepo {
         debug!(bot_id = %bot_id, token = %token, "Token mapping stored");
     }
 
+    async fn get_protocol_version(&self, bot_id: &str) -> u32 {
+        let bots = self.bots.read().await;
+        bots.get(bot_id)
+            .map(|bot| bot.protocol_version)
+            .unwrap_or(1)
+    }
+
+    async fn set_protocol_version(&self, bot_id: &str, version: u32) {
+        let mut bots = self.bots.write().await;
+        if let Some(bot) = bots.get_mut(bot_id) {
+            bot.protocol_version = version;
+        }
+    }
+
     async fn register_http_connection(&self, bot_id: String, token: String) -> String {
         // Create a minimal bot entry if it doesn't exist
         {
@@ -2708,6 +2746,7 @@ impl BotRepoPort for PersistentBotRepo {
                         last_heartbeat: Instant::now(),
                         capabilities: BotCapabilities::default(),
                         ws_connection: None,
+                        protocol_version: 1,
                         session_token: Some(token.clone()),
                         env: Some(resolve_env()),
                         hidden: false,
@@ -3512,6 +3551,7 @@ mod tests {
             last_heartbeat: Instant::now(),
             capabilities: BotCapabilities::default(),
             ws_connection: None,
+            protocol_version: 1,
             session_token: None,
             env: None,
             hidden: false,
@@ -3536,6 +3576,7 @@ mod tests {
                 ..Default::default()
             },
             ws_connection: None,
+            protocol_version: 1,
             session_token: None,
             env: None,
             hidden: false,
@@ -3560,6 +3601,7 @@ mod tests {
                 ..Default::default()
             },
             ws_connection: None,
+            protocol_version: 1,
             session_token: None,
             env: None,
             hidden: false,
@@ -3583,6 +3625,7 @@ mod tests {
                 ..Default::default()
             },
             ws_connection: None,
+            protocol_version: 1,
             session_token: None,
             env: None,
             hidden: false,
@@ -3606,6 +3649,7 @@ mod tests {
                 ..Default::default()
             },
             ws_connection: None,
+            protocol_version: 1,
             session_token: None,
             env: Some("prod".to_string()),
             hidden: false,
@@ -3673,6 +3717,7 @@ mod tests {
                 ..Default::default()
             },
             ws_connection: None,
+            protocol_version: 1,
             session_token: None,
             env: None,
             hidden: false,
@@ -3700,6 +3745,7 @@ mod tests {
                 ..Default::default()
             },
             ws_connection: None,
+            protocol_version: 1,
             session_token: None,
             env: None,
             hidden: false,
@@ -3720,6 +3766,7 @@ mod tests {
             last_heartbeat: Instant::now(),
             capabilities: BotCapabilities::default(),
             ws_connection: None,
+            protocol_version: 1,
             session_token: None,
             env: None,
             hidden: false,
