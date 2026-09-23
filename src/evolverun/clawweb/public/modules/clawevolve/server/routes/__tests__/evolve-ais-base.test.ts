@@ -25,7 +25,8 @@ describe("ClawEvolve AIS Base transport", () => {
 
   async function start(status = "running") {
     const applyAisStatus = vi.fn().mockResolvedValue(true);
-    const createSignedUrl = vi.fn().mockResolvedValue("https://oss.example/signed");
+    const createSignedUrl = vi.fn().mockResolvedValue("https://oss.example/legacy-signed");
+    const createAisSignedUrl = vi.fn().mockResolvedValue("https://oss.example/ais-signed");
     const repo = {
       findTask: vi.fn().mockResolvedValue({ task_id: taskId, config_json: JSON.stringify(config) } as EvolveTaskRow),
       findStep: vi.fn().mockResolvedValue({
@@ -37,27 +38,46 @@ describe("ClawEvolve AIS Base transport", () => {
     app.use(express.json());
     app.use("/api/evolve", createEvolveRouter(repo, {
       artifactUrlStore: { createSignedUrl } as never,
+      aisArtifactUrlStore: { createSignedUrl: createAisSignedUrl } as never,
     }));
     server = await new Promise(resolve => {
       const instance = app.listen(0, () => resolve(instance));
     });
     const port = (server.address() as { port: number }).port;
-    return { base: `http://127.0.0.1:${port}/api/evolve`, applyAisStatus, createSignedUrl };
+    return {
+      base: `http://127.0.0.1:${port}/api/evolve`, applyAisStatus,
+      createSignedUrl, createAisSignedUrl,
+    };
   }
 
   it("issues an upload URL only for the frozen artifact contract", async () => {
-    const { base, createSignedUrl } = await start();
+    const { base, createSignedUrl, createAisSignedUrl } = await start();
     const response = await fetch(`${base}/internal/tasks/${taskId}/steps/${stepId}/artifacts/upload-url`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        artifactName: "result", size: 10, sha256: "a".repeat(64), contentType: "application/json",
+        executor: "ais", artifactName: "result", size: 10,
+        sha256: "a".repeat(64), contentType: "application/json",
       }),
     });
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ method: "PUT", objectKey: "evolution/SA-1/result.json" });
-    expect(createSignedUrl).toHaveBeenCalledWith(
+    expect(createAisSignedUrl).toHaveBeenCalledWith(
       "evolution/SA-1/result.json", "PUT", 86_400, { "Content-Type": "application/json" },
     );
+    expect(createSignedUrl).not.toHaveBeenCalled();
+  });
+
+  it("selects the AIS upload contract from the explicit executor", async () => {
+    const { base, createSignedUrl, createAisSignedUrl } = await start();
+    const response = await fetch(`${base}/internal/tasks/${taskId}/steps/${stepId}/artifacts/upload-url`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ executor: "ais", size: 10,
+        sha256: "a".repeat(64), contentType: "application/json" }),
+    });
+    expect(response.status).toBe(422);
+    expect(await response.json()).toMatchObject({ error: "Artifact 名称不合法" });
+    expect(createAisSignedUrl).not.toHaveBeenCalled();
+    expect(createSignedUrl).not.toHaveBeenCalled();
   });
 
   it("validates and atomically applies the AIS terminal callback", async () => {

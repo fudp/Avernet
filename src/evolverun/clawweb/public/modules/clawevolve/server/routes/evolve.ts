@@ -115,6 +115,8 @@ export type EvolveRouterDeps = {
   artifactStore?: ObjectStore;
   /** Backward-compatible signing-only dependency used by an embedding host. */
   artifactUrlStore?: Pick<ObjectStore, "createSignedUrl">;
+  /** Signing-only dependency for artifacts uploaded from AIS containers. */
+  aisArtifactUrlStore?: Pick<ObjectStore, "createSignedUrl">;
   botWorkflowPermissionRepo?: BotWorkflowPermissionRepository | null;
   runAnalysisStarter?: RunAnalysisStarter | null;
   modelConfig?: EvolveModelConfig;
@@ -1105,6 +1107,7 @@ export function createEvolveRouter(repo: EvolveRepository | null, deps: EvolveRo
   const unavailableArtifactStore = new UnavailableObjectStore();
   const artifactStore = deps.artifactStore ?? unavailableArtifactStore;
   const artifactUrlStore = deps.artifactUrlStore ?? deps.artifactStore ?? unavailableArtifactStore;
+  const aisArtifactUrlStore = deps.aisArtifactUrlStore ?? artifactUrlStore;
   const botWorkflowPermissionRepo = deps.botWorkflowPermissionRepo ?? null;
   const runAnalysisStarter = deps.runAnalysisStarter
     ?? (repo && db ? createRunAnalysisStarter({ repo, db, dispatch }) : null);
@@ -2946,19 +2949,19 @@ export function createEvolveRouter(repo: EvolveRepository | null, deps: EvolveRo
     const task = step ? await repo.findTask(taskId) : null;
     if (!step || !task || step.task_id !== taskId) { res.status(404).json({ error: "Step 不属于指定 Task" }); return; }
     if (TERMINAL_STATUSES.has(step.status)) { res.status(409).json({ error: "终态 Step 不再签发上传 URL" }); return; }
-    if (req.body?.artifactName !== undefined) {
-      const contract = parseAisArtifactContract(parseJson(task.config_json));
-      if (!contract || contract.stepId !== step.step_id) {
+    if (req.body?.executor === "ais") {
+      const aisContract = parseAisArtifactContract(parseJson(task.config_json));
+      if (!aisContract || aisContract.stepId !== step.step_id) {
         res.status(409).json({ error: "当前 Step 不属于有效的 AIS Base attempt" }); return;
       }
       let request;
       try {
-        request = validateAisArtifactRequest(contract, req.body.artifactName, req.body);
+        request = validateAisArtifactRequest(aisContract, req.body?.artifactName, req.body ?? {});
       } catch (error) {
         res.status(422).json({ error: error instanceof Error ? error.message : String(error) }); return;
       }
       const headers = { "Content-Type": request.spec.contentType };
-      const url = await artifactUrlStore.createSignedUrl(
+      const url = await aisArtifactUrlStore.createSignedUrl(
         request.spec.objectKey, "PUT", EVOLVE_ARTIFACT_URL_TTL_SECONDS, headers,
       );
       res.json({
