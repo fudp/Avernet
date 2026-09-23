@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 from typing import cast  # noqa: UP035 - injector binding key matches provider side
-from urllib.parse import urlsplit
 
 from injector import Binder, Module, inject, provider, singleton
 
@@ -46,6 +45,9 @@ from agentclaw.community.core.devices.services.device_service import (
 from agentclaw.community.core.devices.services.device_service_router import (
     DeviceServiceRouter,
 )
+from agentclaw.community.core.devices.services.loopback_targets import (
+    is_loopback_target,
+)
 from agentclaw.community.core.notify.protocol import NotifyBotLister
 from agentclaw.community.core.mcp.services.sync_service import MCPSyncService
 from agentclaw.community.core.service_bot.services.baas_service import BaasService
@@ -74,17 +76,7 @@ class SingleboxBaasDeviceService(BaasDeviceService):
 
     @staticmethod
     def _is_loopback_target(target: str) -> bool:
-        if not target:
-            return False
-        try:
-            host = urlsplit(f"//{target}").hostname
-        except ValueError:
-            host = None
-        if host is None and target.count(":") >= 2:
-            host = target.rsplit(":", 1)[0]
-            if host.startswith("[") and host.endswith("]"):
-                host = host[1:-1]
-        return host in {"localhost", "127.0.0.1", "::1"}
+        return is_loopback_target(target)
 
     def get_device_connection(
         self,
@@ -145,9 +137,6 @@ class SingleboxDevicesModule(Module):
         from agentclaw.community.plugins.local.device_connection_manager import (
             NoopDeviceConnectionManagerPlugin,
         )
-        from agentclaw.community.plugins.local.device_adapter_transport import (
-            InMemoryDeviceAdapterTransport,
-        )
 
         binder.bind(
             DeviceConnectionManagerPlugin,
@@ -155,10 +144,25 @@ class SingleboxDevicesModule(Module):
             scope=singleton,
         )
         binder.bind(BaasDeviceAccessor, to=BaasDeviceAccessor, scope=singleton)
-        binder.bind(
-            DeviceAdapterTransport,
-            to=InMemoryDeviceAdapterTransport,
-            scope=singleton,
+
+    @singleton
+    @provider
+    def device_adapter_transport(self) -> DeviceAdapterTransport:
+        """Singlebox: the in-memory cron adapter with a proxy fallback URL.
+
+        The transport mocks the well-known paths (health, capabilities,
+        skills, /api/cron) in memory and proxies everything else to the
+        engine adapter's HTTP origin. A nil default_adapter_url preserves
+        the original test/sentinel behavior (no network).
+        """
+        from os import environ
+
+        from agentclaw.community.plugins.local.device_adapter_transport import (
+            InMemoryDeviceAdapterTransport,
+        )
+
+        return InMemoryDeviceAdapterTransport(
+            default_adapter_url=environ.get("SINGLEBOX_ENGINE_ADAPTER_URL"),
         )
 
     @singleton
