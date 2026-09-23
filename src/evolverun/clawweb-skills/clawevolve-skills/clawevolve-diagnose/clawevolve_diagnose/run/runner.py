@@ -112,6 +112,10 @@ def run_pipeline(req: RunRequest) -> RunResult:
     _apply_session_analysis_limit(req, pref)
     if req.session_identifiers:
         pref.max_sessions = len(req.session_identifiers)
+        pref.since = ""
+        pref.until = ""
+        pref.time_range_label = "精确 Session"
+        pref.explicit_session_mode = True
     warnings.extend(pref_warnings)
     progress(
         "preference parsed",
@@ -212,6 +216,7 @@ def run_pipeline(req: RunRequest) -> RunResult:
             parse_content=judge_runtime.backend == "api",
         )
         acquisition_manifest = out.parent / "input" / "session-source" / "acquisition-manifest.json"
+        acquisition_manifest.parent.mkdir(parents=True, exist_ok=True)
         write_json(acquisition_manifest, {
             "schemaVersion": "clawevolve.session-acquisition.v1",
             "sourceMode": "local",
