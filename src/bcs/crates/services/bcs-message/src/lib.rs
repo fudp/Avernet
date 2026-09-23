@@ -203,8 +203,8 @@ impl MessageService {
     /// the V1 `bcs-app-session` message-history facade so the two cannot drift.
     ///
     /// Returns:
-    /// - `ManagerWorker` strategy + worker viewer → `(Eq(worker_id), None)`
-    ///   (owner isolation: a worker only reads its own messages).
+    /// - `ManagerWorker` strategy + worker viewer → `(WorkerHistory(worker_id), None)`
+    ///   (worker-owned messages and its own TaskResult display).
     /// - `ManagerWorker` strategy + non-worker bot manager viewer →
     ///   `(PublicOrOwner(view), None)`; none / human viewer →
     ///   `(IsNull, None)` (public-only, VUlai).
@@ -224,7 +224,7 @@ impl MessageService {
         if is_manager_worker {
             let view = Self::manager_worker_history_view(group, session, view_bot_id)?;
             let owner_filter = match view {
-                ManagerWorkerHistoryView::Worker(worker_id) => MessageOwnerFilter::Eq(worker_id),
+                ManagerWorkerHistoryView::Worker(worker_id) => MessageOwnerFilter::WorkerHistory(worker_id),
                 ManagerWorkerHistoryView::Public => match view_bot_id {
                     // Non-worker bot viewer (the manager) reads public + own copies.
                     Some(v) if !v.is_empty() && !v.starts_with("human_") => {
@@ -290,6 +290,8 @@ impl MessageService {
             MessageOwnerFilter::Any => true,
             MessageOwnerFilter::IsNull => owner_bot_id.is_none(),
             MessageOwnerFilter::Eq(expected) => owner_bot_id == Some(expected.as_str()),
+            MessageOwnerFilter::WorkerHistory(expected) => owner_bot_id == Some(expected.as_str()),
+            MessageOwnerFilter::WorkerTaskDisplay(_) => false,
             MessageOwnerFilter::PublicOrOwner(expected) => {
                 owner_bot_id.is_none() || owner_bot_id == Some(expected.as_str())
             }
@@ -587,7 +589,7 @@ impl GroupMessageHistoryService for MessageService {
                 legacy_owner_filter
             };
             let merge_public_opening_message =
-                !hide_opening_message && matches!(&owner_filter, MessageOwnerFilter::Eq(_));
+                !hide_opening_message && matches!(&owner_filter, MessageOwnerFilter::WorkerHistory(_));
 
             info!(
                 session_id = %session_id,
@@ -748,7 +750,7 @@ impl GroupMessageHistoryService for MessageService {
                     match view {
                         ManagerWorkerHistoryView::Public => MessageOwnerFilter::IsNull,
                         ManagerWorkerHistoryView::Worker(worker_id) => {
-                            MessageOwnerFilter::Eq(worker_id)
+                            MessageOwnerFilter::WorkerHistory(worker_id)
                         }
                     }
                 }
@@ -778,6 +780,34 @@ impl GroupMessageHistoryService for MessageService {
                 })?;
             let mut persisted_anchors = panel_page.messages;
             let mut persisted_anchors_have_more = panel_page.has_more;
+            if let MessageOwnerFilter::WorkerHistory(worker_id) = &owner_filter {
+                let display_page = self.message_repo.query_messages(MessageQuery {
+                    group_id: cmd.group_id.clone(), session_id: session_id.clone(),
+                    cursor: cmd.before, limit, keyword: None, sender_id: None,
+                    message_type: Some("chat".into()),
+                    owner_filter: MessageOwnerFilter::WorkerTaskDisplay(worker_id.clone()),
+                    time_range: None, visible_from_seq: None, human_view: human_view.clone(),
+                }).await.map_err(|error| GroupUseCaseError::Service(
+                    ServiceError::InternalError(format!("message repo task-display history error: {error}"))
+                ))?;
+                persisted_anchors_have_more |= display_page.has_more;
+                // Provider history has no TaskResult id. Match only a nearby
+                // worker answer containing the displayed final segment, and
+                // consume each Provider answer at most once.
+                let mut provider_replies = fallback_result.messages.iter()
+                    .filter(|message| message.sender == *worker_id && message.role == MessageRole::Assistant)
+                    .collect::<Vec<_>>();
+                persisted_anchors.extend(display_page.messages.into_iter().filter(|display| {
+                    let text = display.content.as_str().unwrap_or_default();
+                    let matched = (!text.is_empty()).then(|| provider_replies.iter().enumerate()
+                        .filter(|(_, provider)| provider.timestamp <= display.created_at
+                            && display.created_at - provider.timestamp <= 60_000
+                            && provider.content.ends_with(text))
+                        .min_by_key(|(_, provider)| display.created_at - provider.timestamp)
+                        .map(|(index, _)| index)).flatten();
+                    if let Some(index) = matched { provider_replies.swap_remove(index); false } else { true }
+                }));
+            }
             if self.persisted_state_machine_history && session.created_at >= self.state_machine_cutoff_timestamp {
                 // Keep ordinary legacy transcripts, but StateMachine content
                 // comes only from durable rows, including before the chat cutoff.
