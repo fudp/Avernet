@@ -1,3 +1,5 @@
+import type { IDatabase } from './db.js';
+import { cleanupEvolveSchema } from './migrations/evolve-schema-cleanup.js';
 /**
  * Schema DDL for ClawWeb.
  *
@@ -28,6 +30,9 @@ export type DbType = "sqlite" | "mysql" | "zdas";
  * are only needed for SQLite.
  */
 export const sqliteTriggers: string[] = [
+  `CREATE TRIGGER IF NOT EXISTS trg_ce_stage_extension_runs_update AFTER UPDATE ON ce_stage_extension_runs FOR EACH ROW BEGIN UPDATE ce_stage_extension_runs SET gmt_modified = (unixepoch()) WHERE id = NEW.id; END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_ce_skill_versions_update AFTER UPDATE ON ce_skill_versions FOR EACH ROW BEGIN UPDATE ce_skill_versions SET gmt_modified = (unixepoch()) WHERE id = NEW.id; END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_ce_skill_audit_events_update AFTER UPDATE ON ce_skill_audit_events FOR EACH ROW BEGIN UPDATE ce_skill_audit_events SET gmt_modified = (unixepoch()) WHERE id = NEW.id; END`,
   `CREATE TRIGGER IF NOT EXISTS trg_flow_events_update AFTER UPDATE ON flow_events FOR EACH ROW BEGIN UPDATE flow_events SET gmt_modified = (unixepoch()) WHERE id = NEW.id; END`,
   `CREATE TRIGGER IF NOT EXISTS trg_flow_metrics_update AFTER UPDATE ON flow_metrics FOR EACH ROW BEGIN UPDATE flow_metrics SET gmt_modified = (unixepoch()) WHERE id = NEW.id; END`,
   `CREATE TRIGGER IF NOT EXISTS trg_triggered_alerts_update AFTER UPDATE ON triggered_alerts FOR EACH ROW BEGIN UPDATE triggered_alerts SET gmt_modified = (unixepoch()) WHERE id = NEW.id; END`,
@@ -92,7 +97,7 @@ export const sqliteTriggers: string[] = [
  * OceanBase/MySQL cannot index TEXT columns. SQLite treats VARCHAR
  * identically to TEXT so this is fully compatible.
  */
-export const migrations: ReadonlyArray<{ version: number; description: string; sql: string[]; sqliteOnly?: boolean; mysqlOnly?: boolean }> = [
+export const migrations: ReadonlyArray<{ version: number; description: string; sql: string[]; sqliteOnly?: boolean; mysqlOnly?: boolean; migrate?: (db: IDatabase) => Promise<void> }> = [
   {
     version: 1,
     description: "ClawFlow: flow_events, flow_metrics, triggered_alerts",
@@ -3282,5 +3287,11 @@ END`,
       `CREATE UNIQUE INDEX IF NOT EXISTS uk_ce_app_config_key ON ce_app_config (config_key)`,
       `CREATE INDEX IF NOT EXISTS idx_ce_app_config_enabled ON ce_app_config (enabled)`,
     ],
+  },
+  {
+    version: 135,
+    description: "Remove redundant Evolve fields and indexes, preserve feature data",
+    sql: [],
+    migrate: cleanupEvolveSchema,
   },
 ];
