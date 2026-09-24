@@ -54,6 +54,14 @@ class DesiredStateMutation:
     field is read by the command to build its ``ProjectionScope`` and goes no
     further.
     """
+    updated_mcp_codes: frozenset[str] = frozenset()
+    """MCP codes whose Bot-scoped connection override changed."""
+    source_transitions: tuple[tuple[str, str], ...] = ()
+    """Internal, configuration-free ``(from_source, to_source)`` audit facts.
+
+    These facts are consumed only by command-service logging. They deliberately
+    stay outside ``details``, which is spread into public API responses.
+    """
 
 
 @dataclass(frozen=True)

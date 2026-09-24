@@ -59,6 +59,7 @@ class UnifiedConfig:
     # ``has_config``. Always ``True`` for a write result.
     exists: bool = field(default=True)
     sync_results: list[dict[str, Any]] | None = field(default=None)
+    sync_summary: dict[str, int] | None = field(default=None)
 
 
 def mcp_coords_from_record(bot_id: str, owner_id: str) -> BotConfigCoords:
@@ -168,9 +169,12 @@ async def write_unified_config(
     3. Confirm the server exists via the marketplace, **before** any write, so a
        bad server code never touches the database.
     4. Write the row, keeping the previous config for rollback.
-    5. Push to every device under the identity.
-    6. If the push fails, roll the write back and raise — the caller never ends
-       up with a config that is stored but not in effect.
+    5. Best-effort push only to the effective consumers identified during
+       validation, and collect their outcomes.
+    6. Keep the write when individual Bot delivery fails: the stored user
+       config is desired state and a later runtime projection can converge it.
+       Only a batch-level failure (for example, Bot enumeration unavailable)
+       rolls the write back and raises.
 
     Returns a write-shaped :class:`UnifiedConfig`: ``headers`` is ``None`` (the
     write response has never echoed them) and the value fields reflect the
@@ -188,6 +192,29 @@ async def write_unified_config(
     mcp_data = market_service.get_mcp_detail(server_code)
     if not mcp_data:
         raise McpServerNotFoundError(server_code)
+
+    candidate = config_service.validate_user_config_update(
+        user_id=user_id,
+        server_code=server_code,
+        api_key=api_key,
+        headers=headers,
+        endpoint_env=endpoint_env,
+        transport_protocol=normalized_tp,
+        entity_id=entity_id,
+        entity_type=entity_type,
+    )
+    if not candidate["valid"]:
+        if candidate.get("kind") == "center_unavailable":
+            raise McpMarketUnavailableError(candidate["error"])
+        raise McpConfigValueError(candidate["error"])
+
+    # ``validate_user_config_update`` is the canonical runtime-equivalent
+    # control-plane read. Reuse its answer rather than enumerating every Bot
+    # and probing each device merely to discover that it does not consume this
+    # MCP. ``None`` retains compatibility with an out-of-tree implementation
+    # of the config service until it adopts the enriched result.
+    affected_bot_ids = candidate.get("affected_bot_ids")
+    affected_bot_owners = candidate.get("affected_bot_owners")
 
     old_config = config_service.update_user_unified_config(
         user_id=user_id,
@@ -216,15 +243,14 @@ async def write_unified_config(
             custom_headers=headers,
             endpoint_env=endpoint_env,
             transport_protocol=normalized_tp,
+            target_bot_ids=affected_bot_ids,
+            target_bot_owners=affected_bot_owners,
         )
     except Exception as exc:
-        # The sync service contracts to *return* a failure dict rather than
-        # raise, but a device push that raises anyway (a dependency throwing,
-        # a future change) must not leave the freshly written credentials
-        # stored-but-unpushed — that is exactly the atomic write-and-push
-        # contract this function promises. Roll the row back and surface it as
-        # a sync failure, the same class a returned failure raises, so each
-        # surface maps it (internal 500 / public 502) with the row restored.
+        # Per-Bot delivery errors are converted to sync_results by the batch
+        # service. An exception here is therefore a batch-level failure (or a
+        # programming/dependency fault), for which rollback remains the safe
+        # answer.
         _roll_back()
         raise McpSyncFailedError(str(exc)) from exc
 
@@ -248,6 +274,7 @@ async def write_unified_config(
         headers=None,  # write path has never echoed headers — read path does
         has_config=bool(api_key or headers or transport_protocol),
         sync_results=result.get("sync_results"),
+        sync_summary=result.get("sync_summary"),
     )
 
 

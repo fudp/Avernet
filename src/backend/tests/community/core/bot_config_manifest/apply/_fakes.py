@@ -469,6 +469,7 @@ class FakeSkillUploadService:
         # never touches this: the fake models "installed" the way the real
         # service does — only a completed upload/replace publishes.
         self.installed: dict[str, bytes] = {}
+        self.deleted: list[str] = []
         self._next_id = 100
 
     async def upload_local_skill(
@@ -504,6 +505,14 @@ class FakeSkillUploadService:
             "actor_id": actor_id,
         }
 
+    async def delete_local_skill(
+        self, *, skill_id: str, name: str, bot_id: str, owner_id: str,
+        actor_id: str,
+    ) -> None:
+        self.deleted.append(skill_id)
+        self.rows.pop(name, None)
+        self.installed.pop(name, None)
+
     async def installed_package_digest(
         self, *, bot, bot_id: str, owner_id: str, name: str
     ):
@@ -521,6 +530,34 @@ class FakeSkillUploadService:
         return [
             call["package"] for call in self.uploads if call["name"] == name
         ]
+
+
+class FakeLocalSkillDeleteService:
+    """The explicit delete Service API over the package fake's shared rows."""
+
+    def __init__(self, packages: FakeSkillUploadService) -> None:
+        self._packages = packages
+
+    async def delete_local_skill(
+        self, *, skill_id: str, owner_id: str, user_id: str
+    ) -> None:
+        name = next(
+            (
+                name
+                for name, row in self._packages.rows.items()
+                if str(row["id"]) == str(skill_id)
+            ),
+            None,
+        )
+        if name is None:
+            return
+        await self._packages.delete_local_skill(
+            skill_id=skill_id,
+            name=name,
+            bot_id="fake-bot",
+            owner_id=owner_id,
+            actor_id=user_id,
+        )
 
 
 def _skill_name_of(package: bytes, parser: Any) -> str | None:
@@ -560,9 +597,19 @@ class FakeCapabilityReader:
         self,
         assets: list[Any] | None = None,
         member_ids: set[int] | None = None,
+        local_assets: list[Any] | None = None,
     ) -> None:
         self.assets = tuple(assets or ())
         self.member_ids = frozenset(member_ids or ())
+        self.local_assets = tuple(
+            local_assets
+            if local_assets is not None
+            else [
+                asset
+                for asset in self.assets
+                if str(getattr(asset, "git_path", "")).startswith("local://")
+            ]
+        )
         self.asset_reads: list[dict[str, Any]] = []
 
     def active_skill_assets(self, *, bot_id: str, owner_id: str, bot=None):
@@ -572,10 +619,23 @@ class FakeCapabilityReader:
     def member_skill_ids(self, *, bot):
         return self.member_ids
 
+    def local_skill_assets(self, *, bot_id: str, owner_id: str, bot=None):
+        return self.local_assets
 
-def skill_asset(skill_id: int, name: str, git_path: str = "local://x"):
+
+def skill_asset(
+    skill_id: int,
+    name: str,
+    git_path: str = "local://x",
+    mcp_dependencies: tuple[object, ...] = (),
+):
     """One active-skill asset, the RegisteredSkillAsset shape."""
-    return SimpleNamespace(skill_id=skill_id, name=name, git_path=git_path)
+    return SimpleNamespace(
+        skill_id=skill_id,
+        name=name,
+        git_path=git_path,
+        mcp_dependencies=mcp_dependencies,
+    )
 
 
 def build_skill_zip(name: str, *, extra: list[tuple[str, bytes]] | None = None) -> bytes:
@@ -691,6 +751,10 @@ class FakeActivationService:
     ) -> None:
         self.installed = set(installed or ())
         self.platform_defaults = set(platform_defaults or ())
+        self.set_managed: set[str] = set()
+        self.mcp_overrides: dict[str, dict] = {}
+        self.manifest_direct_mcps: set[str] = set()
+        self.configured: list[tuple[str, dict | None]] = []
         self.governed_skills = set(governed_skills or ())
         self.activated: list[str] = []
         self.deactivated: list[str] = []
@@ -711,6 +775,27 @@ class FakeActivationService:
     ) -> frozenset[str]:
         return frozenset(self.platform_defaults)
 
+    def get_mcp_overrides(
+        self, *, bot_id: str, owner_id: str, actor_id: str
+    ) -> dict[str, dict]:
+        return dict(self.mcp_overrides)
+
+    def manifest_direct_mcp_codes(
+        self, *, bot_id: str, owner_id: str, actor_id: str,
+        server_codes: set[str],
+    ) -> set[str]:
+        return set(server_codes) & self.manifest_direct_mcps
+
+    def set_managed_mcp_codes(
+        self,
+        *,
+        bot_id: str,
+        owner_id: str,
+        actor_id: str,
+        server_codes: set[str],
+    ) -> set[str]:
+        return set(server_codes) & self.set_managed
+
     async def activate_mcp(
         self, *, server_code: str, bot_id: str, owner_id: str, actor_id: str,
         project: bool = True,
@@ -721,6 +806,26 @@ class FakeActivationService:
         self.installed.add(server_code)
         return {}
 
+    async def set_mcp_override(
+        self,
+        *,
+        server_code: str,
+        config: dict | None,
+        bot_id: str,
+        owner_id: str,
+        actor_id: str,
+        project: bool = True,
+    ) -> dict[str, Any]:
+        self.projections.append(project)
+        self._refuse_if_platform_owned(server_code)
+        self.installed.add(server_code)
+        self.configured.append((server_code, config))
+        if config:
+            self.mcp_overrides[server_code] = dict(config)
+        else:
+            self.mcp_overrides.pop(server_code, None)
+        return {}
+
     async def deactivate_mcp(
         self, *, server_code: str, bot_id: str, owner_id: str, actor_id: str,
         project: bool = True,
@@ -729,6 +834,8 @@ class FakeActivationService:
         self._refuse_if_platform_owned(server_code)
         self.deactivated.append(server_code)
         self.installed.discard(server_code)
+        self.manifest_direct_mcps.discard(server_code)
+        self.mcp_overrides.pop(server_code, None)
         return {}
 
     async def activate_skill(
@@ -751,6 +858,54 @@ class FakeActivationService:
         self.skill_deactivations.append(int(skill_id))
         return {"id": skill_id, "changed": True}
 
+    async def claim_manifest_skill(
+        self, *, skill_id: str, bot_id: str, owner_id: str, actor_id: str,
+        apply_id: str | None, project: bool = True,
+    ) -> dict[str, Any]:
+        self.projections.append(project)
+        self.governed_skills.discard(int(skill_id))
+        self.installed_skills.add(int(skill_id))
+        self.skill_activations.append(int(skill_id))
+        return {"id": skill_id, "changed": True}
+
+    async def remove_manifest_skill(
+        self, *, skill_id: str, bot_id: str, owner_id: str, actor_id: str,
+        apply_id: str | None, remove_inactive_memberships: bool,
+        project: bool = True,
+    ) -> dict[str, Any]:
+        self.projections.append(project)
+        self.installed_skills.discard(int(skill_id))
+        self.governed_skills.discard(int(skill_id))
+        self.skill_deactivations.append(int(skill_id))
+        return {"id": skill_id, "changed": True}
+
+    async def claim_manifest_mcp(
+        self, *, server_code: str, config: dict | None, bot_id: str,
+        owner_id: str, actor_id: str, apply_id: str | None,
+        project: bool = True,
+    ) -> dict[str, Any]:
+        self.projections.append(project)
+        self.set_managed.discard(server_code)
+        self.installed.add(server_code)
+        self.manifest_direct_mcps.add(server_code)
+        self.configured.append((server_code, config))
+        if config:
+            self.mcp_overrides[server_code] = dict(config)
+        else:
+            self.mcp_overrides.pop(server_code, None)
+        return {}
+
+    async def remove_manifest_mcp(
+        self, *, server_code: str, bot_id: str, owner_id: str, actor_id: str,
+        apply_id: str | None, project: bool = True,
+    ) -> dict[str, Any]:
+        self.projections.append(project)
+        self.deactivated.append(server_code)
+        self.installed.discard(server_code)
+        self.manifest_direct_mcps.discard(server_code)
+        self.mcp_overrides.pop(server_code, None)
+        return {}
+
     def _refuse_if_platform_owned(self, server_code: str) -> None:
         if server_code in self.platform_defaults:
             raise PlatformPolicyConflict("RESOURCE_MANAGED_BY_PLATFORM_POLICY")
@@ -764,6 +919,7 @@ class FakeActivationService:
         return (
             len(self.activated)
             + len(self.deactivated)
+            + len(self.configured)
             + len(self.skill_activations)
             + len(self.skill_deactivations)
         )
@@ -816,6 +972,11 @@ class FakeMcpAuth:
             # The documented outage sentinel: advisory "yes" with no level.
             return {"has_permission": True, "access_level": None}
         return {"has_permission": True, "access_level": "PUBLIC"}
+
+
+class FakeMcpConfigService:
+    def validate_bot_override(self, **_kwargs) -> dict[str, Any]:
+        return {"valid": True, "error": None}
 
 
 def make_context(
@@ -1023,8 +1184,10 @@ def device_port_bundle(
     script_service=None,
     activation_service=None,
     mcp_auth_service=None,
+    mcp_config_service=None,
     identity_service=None,
     upload_service=None,
+    delete_service=None,
     capability_reader=None,
     package_validator=None,
     entry_fetcher=None,
@@ -1061,15 +1224,21 @@ def device_port_bundle(
         DeclaredSourceResolver,
     )
 
+    effective_upload = upload_service or FakeSkillUploadService()
+    effective_delete = delete_service or FakeLocalSkillDeleteService(
+        effective_upload
+    )
     bundle = MaterialiserPorts(
         script_service=script_service or FakeStartupScriptService(),
         activation_service=DeviceActivation(
             activation_service or FakeActivationService()
         ),
         mcp_auth_service=mcp_auth_service or FakeMcpAuth(),
+        mcp_config_service=mcp_config_service or FakeMcpConfigService(),
         identity_service=DeviceIdentity(identity_service or FakeIdentityService()),
         upload_service=DeviceSkillPackageUpload(
-            upload_service or FakeSkillUploadService()
+            effective_upload,
+            effective_delete,
         ),
         capability_reader=capability_reader or FakeCapabilityReader(),
         package_validator=package_validator or real_validator(),

@@ -14,6 +14,16 @@ from typing import Any, Protocol
 class OpenClawFilePort(Protocol):
     """Native filesystem operations over the OpenClaw workspace."""
 
+    async def count_files(self, path: str) -> dict[str, Any]:
+        """Return path/file_count/elapsed_ms; fd-confined, cancellable and unfiltered.
+
+        Relative paths use the configured workspace's parent, absolute paths
+        must remain inside that root or sibling openclawExt. Follow confined
+        symlinks; cyclic, dangling and out-of-root links contribute zero.
+        Ordinary scan failures raise FileCountError. See file-count-contract.md.
+        """
+        ...
+
     async def upload(self, target_path: str, content: bytes) -> dict[str, Any]:
         """Write ``content`` to ``target_path`` (after path rewrite).
 

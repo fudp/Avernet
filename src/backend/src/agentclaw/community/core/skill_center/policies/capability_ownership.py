@@ -6,10 +6,13 @@ R1 — Set-managed, no direct control. A capability that is a member of ANY
      deactivate the Set; exclude/un-exclude for Default-Set members).
 R2 — Deactivate before joining. A capability holding a direct Installation
      row cannot be added to a Set (checked before R3 — today's precedence).
-R3 — One Set per capability: held by ANY Set (ordinary or Default, excluded
-     or not) ⇒ cannot be added to another.
+R3 — One effective Set source per capability: another ordinary Set or an
+     unexcluded Default Set blocks joining. An excluded Default membership
+     is released for ordinary Set addition only.
 
-Identical for skills and MCPs. Callers read the facts; this module decides.
+The Skill and MCP add-to-ordinary-Set commands treat an excluded Default
+membership as released by that source; Direct control keeps R1-R3.
+Callers read the facts; this module decides the resulting conflict.
 """
 
 from __future__ import annotations
@@ -86,10 +89,11 @@ def require_direct_mcp_control_allowed(
 def require_non_platform_mcp(
     *, server_code: str, platform_default_codes: frozenset[str]
 ) -> None:
-    """Policy-owned MCPs cannot be Direct or ordinary-Set controlled.
+    """Policy-owned MCPs cannot be directly controlled or joined unexcluded.
 
     Pass the complete applicable engine/template policy, before exclusions:
-    excluding a default changes activation, not ownership.
+    Direct control remains forbidden after exclusion. Ordinary-Set addition
+    applies its own source-scoped exclusion rule in the transactional command.
     """
     if server_code in platform_default_codes:
         raise SkillSetControlPlaneConflictError(

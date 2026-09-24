@@ -43,6 +43,9 @@ class _Files:
         }
         return True
 
+    async def list_dir(self, path):
+        return [name for name in self.files if name.startswith(f"{path}/")] or None
+
 
 class _Skills:
     def __init__(
@@ -135,9 +138,17 @@ class _Factory:
         self.locator_kwargs = None
 
     def local_skill_package_storage_for_locator(
-        self, *, locator, entity_type, is_desktop, is_teclaw, **_kwargs
+        self,
+        *,
+        locator,
+        skill_name,
+        entity_type,
+        is_desktop,
+        is_teclaw,
+        **_kwargs,
     ):
         self.locator_kwargs = {
+            "skill_name": skill_name,
             "entity_type": entity_type,
             "is_desktop": is_desktop,
             "is_teclaw": is_teclaw,
@@ -208,7 +219,27 @@ async def test_inactive_delete_removes_package_once_then_database_state():
     assert skills.deleted is True
     assert files.files == {}
     assert files.delete_calls == ["/skills/one"]
+    assert service._skill_service_factory.locator_kwargs["skill_name"] == "one"
     assert guard.events == [("dev", "owner", "bot"), "release"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_recorded_locator_maps_to_storage_failure_without_deleting():
+    service, files, skills, _guard = _service()
+
+    class _RejectingFactory:
+        def local_skill_package_storage_for_locator(self, **_kwargs):
+            raise ValueError("Local Skill cleanup locator escapes skills-local")
+
+    service._skill_service_factory = _RejectingFactory()
+
+    with pytest.raises(LocalSkillStorageError):
+        await service.delete_local_skill(
+            skill_id="9", owner_id="owner", user_id="owner"
+        )
+
+    assert skills.deleted is False
+    assert files.delete_calls == []
 
 
 @pytest.mark.asyncio
@@ -325,6 +356,19 @@ async def test_package_delete_failure_leaves_database_state_unchanged():
     assert skills.deleted is False
     assert files.files == {"/skills/one/SKILL.md": b"name: one\ndescription: One\n"}
     assert files.delete_calls == ["/skills/one"]
+
+
+@pytest.mark.asyncio
+async def test_missing_package_repairs_the_stale_database_row_idempotently():
+    service, files, skills, _guard = _service()
+    files.files.clear()
+
+    await service.delete_local_skill(
+        skill_id="9", owner_id="owner", user_id="owner"
+    )
+
+    assert skills.deleted is True
+    assert files.delete_calls == []
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,8 @@ the fakes count their calls and the tests read those counts.
 from __future__ import annotations
 
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import yaml
@@ -35,6 +37,9 @@ from agentclaw.community.core.bot_config_manifest.capabilities import (
 from agentclaw.community.core.bot_config_manifest.apply.source_resolver import (
     DeclaredSourceResolver,
 )
+from agentclaw.community.core.skill_center.errors import (
+    ManifestDesiredStateCommittedError,
+)
 
 from ._fakes import (
     FakeActivationService,
@@ -59,21 +64,30 @@ from tests.community.core.bot_config_manifest.apply._fakes import FakeObjectStor
 _arca_steps = ArcaDelivery(lambda: None).steps_for
 
 
-
-def _engine(scripts=None, activations=None, auth=None):
+def _engine(
+    scripts=None, activations=None, auth=None, mcp_config=None,
+    uploads=None, reader=None, entry_fetcher=None,
+):
     """The W4-shaped engine: mcp + script over their fakes (these tests are
     the engine's contract, not the two fetch-consuming categories' — those
     have their own materialiser files)."""
+    if mcp_config is None:
+        mcp_config = MagicMock()
+        mcp_config.validate_bot_override.return_value = {
+            "valid": True,
+            "error": None,
+        }
     return ApplyOrchestrator(
         build_materialisers(
             script_service=scripts or FakeStartupScriptService(),
             activation_service=activations or FakeActivationService(),
             mcp_auth_service=auth or FakeMcpAuth(),
+            mcp_config_service=mcp_config,
             identity_service=FakeIdentityService(),
-            upload_service=FakeSkillUploadService(),
-            capability_reader=FakeCapabilityReader(),
+            upload_service=uploads or FakeSkillUploadService(),
+            capability_reader=reader or FakeCapabilityReader(),
             package_validator=real_validator(),
-            entry_fetcher=_dummy_entry_fetcher(),
+            entry_fetcher=entry_fetcher or _dummy_entry_fetcher(),
             resource_service=FakeResourceFileService(),
             cli_tool_service=object(),
         ),
@@ -308,6 +322,230 @@ async def test_a_declared_category_removes_what_it_does_not_declare():
     assert _outcomes(report) == {"keep": EntryOutcome.UNCHANGED}
 
 
+@pytest.mark.asyncio
+async def test_mcp_config_change_is_updated_and_reapplying_is_unchanged():
+    activations = FakeActivationService(installed={"gh"})
+    activations.mcp_overrides["gh"] = {"headers": {"X-Project": "old"}}
+    document = """schema_version: 1
+manifest:
+  mcp:
+    - server_code: gh
+      config:
+        headers:
+          X-Project: new
+"""
+    engine = _engine(activations=activations)
+
+    first = await _apply(engine, document)
+    second = await _apply(engine, document)
+
+    assert _outcomes(first) == {"gh": EntryOutcome.UPDATED}
+    assert _outcomes(second) == {"gh": EntryOutcome.UNCHANGED}
+    assert activations.configured == [("gh", {"headers": {"X-Project": "new"}})]
+
+
+@pytest.mark.asyncio
+async def test_bare_mcp_entry_clears_an_existing_bot_override():
+    activations = FakeActivationService(installed={"gh"})
+    activations.mcp_overrides["gh"] = {"url": "https://old.example/mcp"}
+
+    report = await _apply(
+        _engine(activations=activations),
+        "schema_version: 1\nmanifest:\n  mcp:\n    - server_code: gh\n",
+    )
+
+    assert _outcomes(report) == {"gh": EntryOutcome.UPDATED}
+    assert activations.configured == [("gh", None)]
+
+
+@pytest.mark.asyncio
+async def test_new_bare_mcp_entry_also_clears_an_orphan_override():
+    activations = FakeActivationService()
+    activations.mcp_overrides["gh"] = {"url": "https://orphan.example/mcp"}
+
+    report = await _apply(
+        _engine(activations=activations),
+        "schema_version: 1\nmanifest:\n  mcp:\n    - server_code: gh\n",
+    )
+
+    assert _outcomes(report) == {"gh": EntryOutcome.CREATED}
+    assert activations.installed == {"gh"}
+    assert activations.configured == [("gh", None)]
+    assert activations.mcp_overrides == {}
+
+
+@pytest.mark.asyncio
+async def test_bare_mcp_entry_validates_inherited_config_before_any_write():
+    activations = FakeActivationService()
+    config_service = MagicMock()
+    config_service.validate_bot_override.return_value = {
+        "valid": False,
+        "error": "inherited endpoint is unavailable",
+    }
+
+    report = await _apply(
+        _engine(activations=activations, mcp_config=config_service),
+        "schema_version: 1\nmanifest:\n  mcp:\n    - server_code: gh\n",
+    )
+
+    assert report.status is ApplyStatus.FAILED
+    assert activations.writes == 0
+    config_service.validate_bot_override.assert_called_once_with(
+        user_id="u_owner",
+        server_code="gh",
+        config=None,
+        engine_type="claude_code",
+    )
+
+
+@pytest.mark.asyncio
+async def test_header_name_case_only_change_is_unchanged():
+    activations = FakeActivationService(installed={"gh"})
+    activations.mcp_overrides["gh"] = {"headers": {"X-Project": "same"}}
+
+    report = await _apply(
+        _engine(activations=activations),
+        """schema_version: 1
+manifest:
+  mcp:
+    - server_code: gh
+      config:
+        headers:
+          x-project: same
+""",
+    )
+
+    assert _outcomes(report) == {"gh": EntryOutcome.UNCHANGED}
+    assert activations.configured == []
+
+
+@pytest.mark.asyncio
+async def test_mcp_center_config_validation_fails_category_before_any_write():
+    activations = FakeActivationService()
+    config_service = MagicMock()
+    config_service.validate_bot_override.return_value = {
+        "valid": False,
+        "error": "MCP 在 PRE 环境没有可用的 SSE 端点",
+    }
+
+    report = await _apply(
+        _engine(activations=activations, mcp_config=config_service),
+        """schema_version: 1
+manifest:
+  mcp:
+    - server_code: first
+      config:
+        endpoint_env: PRE
+        transport_protocol: SSE
+    - server_code: second
+""",
+    )
+
+    assert report.status is ApplyStatus.FAILED
+    assert activations.writes == 0
+
+
+@pytest.mark.asyncio
+async def test_set_managed_mcp_is_converted_to_a_direct_claim():
+    activations = FakeActivationService(installed={"owned"})
+    activations.set_managed = {"owned"}
+
+    report = await _apply(
+        _engine(activations=activations),
+        """schema_version: 1
+manifest:
+  mcp:
+    - server_code: new-first
+    - server_code: owned
+      config:
+        headers:
+          X-Project: value
+""",
+    )
+
+    assert report.status is ApplyStatus.SUCCEEDED
+    assert _outcomes(report) == {
+        "new-first": EntryOutcome.CREATED,
+        "owned": EntryOutcome.UPDATED,
+    }
+    assert activations.set_managed == set()
+    assert activations.installed == {"new-first", "owned"}
+
+
+@pytest.mark.asyncio
+async def test_source_only_mcp_conversion_reports_unchanged_but_writes():
+    activations = FakeActivationService(installed={"owned"})
+    activations.set_managed = {"owned"}
+
+    engine = _engine(activations=activations)
+    document = "schema_version: 1\nmanifest:\n  mcp:\n    - server_code: owned\n"
+    report = await _apply(engine, document)
+
+    assert _outcomes(report) == {"owned": EntryOutcome.UNCHANGED}
+    assert activations.configured == [("owned", None)]
+    assert activations.set_managed == set()
+    again = await _apply(engine, document)
+    assert _outcomes(again) == {"owned": EntryOutcome.UNCHANGED}
+    assert activations.configured == [("owned", None)]
+
+
+@pytest.mark.asyncio
+async def test_dependency_retained_mcp_clears_explicit_supply_without_removed_report():
+    activations = FakeActivationService(installed={"mcp.dependency"})
+    activations.mcp_overrides["mcp.dependency"] = {
+        "headers": {"X-Stale": "value"}
+    }
+    reader = FakeCapabilityReader(assets=[SimpleNamespace(
+        skill_id=3, name="dependent", git_path="local://dependent",
+        mcp_dependencies=({"code": "mcp.dependency"},),
+    )])
+
+    report = await _apply(
+        _engine(activations=activations, reader=reader),
+        "schema_version: 1\nmanifest:\n  mcp: []\n",
+    )
+
+    category = report.categories[0]
+    assert category.removals == ()
+    assert _outcomes(report) == {"mcp.dependency": EntryOutcome.UPDATED}
+    assert "Skill dependency" in (category.entries[0].note or "")
+    assert activations.deactivated == ["mcp.dependency"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_dependency_becomes_direct_but_reports_unchanged():
+    activations = FakeActivationService()
+    reader = FakeCapabilityReader(assets=[SimpleNamespace(
+        skill_id=3, name="dependent", git_path="local://dependent",
+        mcp_dependencies=({"code": "mcp.dependency"},),
+    )])
+
+    report = await _apply(
+        _engine(activations=activations, reader=reader),
+        "schema_version: 1\nmanifest:\n  mcp:\n"
+        "    - server_code: mcp.dependency\n",
+    )
+
+    assert _outcomes(report) == {"mcp.dependency": EntryOutcome.UNCHANGED}
+    assert activations.installed == {"mcp.dependency"}
+
+
+@pytest.mark.asyncio
+async def test_omitted_active_set_managed_mcp_is_removed_from_explicit_supply():
+    activations = FakeActivationService(installed={"keep", "owned"})
+    activations.set_managed = {"owned"}
+
+    report = await _apply(
+        _engine(activations=activations),
+        "schema_version: 1\nmanifest:\n  mcp:\n    - server_code: keep\n",
+    )
+
+    assert report.status is ApplyStatus.SUCCEEDED
+    assert activations.deactivated == ["owned"]
+    assert activations.installed == {"keep"}
+    assert report.categories[0].removals == ("owned",)
+
+
 # ── per-category area ───────────────────────────────────────────────────────
 
 
@@ -511,7 +749,7 @@ async def test_a_raising_materialiser_is_reported_as_written_nothing():
     """
 
     class ExplodingActivation(FakeActivationService):
-        async def activate_mcp(self, **kwargs):
+        async def claim_manifest_mcp(self, **kwargs):
             raise RuntimeError("device unreachable")
 
     activations = ExplodingActivation()
@@ -572,7 +810,7 @@ def test_the_report_payload_names_every_field_it_emits():
 
 
 @pytest.mark.asyncio
-async def test_a_platform_default_is_refused_before_anything_is_activated():
+async def test_a_platform_default_is_converted_to_a_direct_claim():
     """The review finding, as its regression test.
 
     ``activate_mcp`` refuses a code the bot's engine/template policy owns, from
@@ -585,21 +823,24 @@ async def test_a_platform_default_is_refused_before_anything_is_activated():
     it did before the fix too, but that it failed *having written nothing*.
     """
     activations = FakeActivationService(platform_defaults={"platform-owned"})
-    report = await _apply(
-        _engine(activations=activations),
+    engine = _engine(activations=activations)
+    document = (
         "schema_version: 1\nmanifest:\n  mcp:\n"
         "    - server_code: ordinary\n"
-        "    - server_code: platform-owned\n",
+        "    - server_code: platform-owned\n"
     )
+    report = await _apply(engine, document)
 
-    assert activations.writes == 0, (
-        "the category was half-written: the ordinary server was activated for "
-        "real before the platform default was refused"
-    )
-    assert activations.installed == set()
-    assert report.categories[0].aborted is True
-    reasons = {entry.identity: entry.reason for entry in report.categories[0].entries}
-    assert "platform default" in (reasons["platform-owned"] or "")
+    assert activations.writes == 2
+    assert activations.installed == {"ordinary", "platform-owned"}
+    assert report.categories[0].aborted is False
+    assert _outcomes(report) == {
+        "ordinary": EntryOutcome.CREATED,
+        "platform-owned": EntryOutcome.UNCHANGED,
+    }
+    configured = list(activations.configured)
+    await _apply(engine, document)
+    assert activations.configured == configured
 
 
 @pytest.mark.asyncio
@@ -611,12 +852,13 @@ async def test_the_ordinary_server_still_applies_when_no_default_is_declared():
         "schema_version: 1\nmanifest:\n  mcp:\n    - server_code: ordinary\n",
     )
 
-    assert activations.activated == ["ordinary"]
+    assert activations.installed == {"ordinary"}
+    assert activations.configured == [("ordinary", None)]
     assert report.categories[0].aborted is False
 
 
 @pytest.mark.asyncio
-async def test_a_platform_default_is_never_removed_by_omission():
+async def test_a_platform_default_is_excluded_when_omitted():
     """The removal half of the same guard.
 
     Overwrite reads an absent entry as "remove it", but a platform default is
@@ -637,9 +879,9 @@ async def test_a_platform_default_is_never_removed_by_omission():
     )
 
     assert report.categories[0].aborted is False
-    assert activations.deactivated == []
-    assert report.categories[0].removals == ()
-    assert "became-a-default" in activations.installed
+    assert activations.deactivated == ["became-a-default"]
+    assert report.categories[0].removals == ("became-a-default",)
+    assert "became-a-default" not in activations.installed
 
 
 @pytest.mark.asyncio
@@ -685,7 +927,7 @@ async def test_a_declared_empty_category_that_fails_is_not_reported_successful()
     async def _explode(**_kwargs):
         raise RuntimeError("the activation service is down")
 
-    activations.deactivate_mcp = _explode
+    activations.remove_manifest_mcp = _explode
 
     report = await _apply(
         _engine(activations=activations),
@@ -713,7 +955,7 @@ async def test_one_aborted_empty_category_downgrades_an_otherwise_good_apply():
     async def _explode(**_kwargs):
         raise RuntimeError("the activation service is down")
 
-    activations.deactivate_mcp = _explode
+    activations.remove_manifest_mcp = _explode
 
     report = await _apply(
         _engine(activations=activations),
@@ -737,7 +979,7 @@ async def test_an_abort_during_the_write_says_the_area_may_have_changed():
     async def _explode(**_kwargs):
         raise RuntimeError("the activation service is down")
 
-    activations.activate_mcp = _explode
+    activations.claim_manifest_mcp = _explode
 
     report = await _apply(
         _engine(activations=activations),
@@ -748,6 +990,138 @@ async def test_an_abort_during_the_write_says_the_area_may_have_changed():
     assert category.aborted is True
     assert category.partially_written is True
     assert category.as_dict()["partially_written"] is True
+    assert report.status is ApplyStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_a_later_mcp_failure_after_a_committed_claim_reports_partial():
+    activations = FakeActivationService()
+    original_claim = activations.claim_manifest_mcp
+
+    async def _fail_second(**kwargs):
+        if kwargs["server_code"] == "second":
+            raise RuntimeError("second MCP failed")
+        return await original_claim(**kwargs)
+
+    activations.claim_manifest_mcp = _fail_second
+    report = await _apply(
+        _engine(activations=activations),
+        "schema_version: 1\nmanifest:\n  mcp:\n"
+        "    - server_code: first\n"
+        "    - server_code: second\n",
+    )
+
+    assert report.status is ApplyStatus.PARTIAL
+    assert activations.installed == {"first"}
+    assert report.categories[0].partially_written is True
+
+
+@pytest.mark.asyncio
+async def test_first_mcp_post_commit_failure_reports_partial():
+    activations = FakeActivationService()
+
+    async def _commit_then_fail(**kwargs):
+        activations.installed.add(kwargs["server_code"])
+        raise ManifestDesiredStateCommittedError()
+
+    activations.claim_manifest_mcp = _commit_then_fail
+    report = await _apply(
+        _engine(activations=activations),
+        "schema_version: 1\nmanifest:\n  mcp:\n"
+        "    - server_code: committed\n",
+    )
+
+    assert report.status is ApplyStatus.PARTIAL
+    assert activations.installed == {"committed"}
+
+
+@pytest.mark.asyncio
+async def test_failed_skill_write_refreshes_actual_dependencies_before_mcp():
+    from ._fakes import (
+        FakeObjectCredentials,
+        OSS_AUTH,
+        OSS_BUCKET,
+        build_skill_zip,
+        declared_session,
+        seeded_object_store,
+        skill_asset,
+    )
+
+    key = "skills/new-skill.zip"
+    objects = seeded_object_store({key: build_skill_zip("new-skill")})
+    fetcher = DeclaredSourceResolver(
+        FakeManifestContent(), FakeObjectCredentials(), objects
+    )
+    reader = FakeCapabilityReader(
+        assets=[
+            skill_asset(
+                7,
+                "old-skill",
+                mcp_dependencies=({"code": "mcp.actual"},),
+            )
+        ]
+    )
+    activations = FakeActivationService(installed={"mcp.actual"})
+    activations.mcp_overrides["mcp.actual"] = {
+        "headers": {"X-Stale": "value"}
+    }
+
+    async def _fail_claim(**_kwargs):
+        raise RuntimeError("Direct claim failed after package upload")
+
+    activations.claim_manifest_skill = _fail_claim
+    report = await _apply(
+        _engine(
+            activations=activations,
+            reader=reader,
+            entry_fetcher=fetcher,
+        ),
+        "schema_version: 1\nmanifest:\n"
+        "  skills:\n"
+        "    - name: new-skill\n"
+        "      source:\n"
+        "        protocol: oss\n"
+        f"        bucket: {OSS_BUCKET}\n"
+        f"        key: {key}\n"
+        f"        auth: {OSS_AUTH}\n"
+        "  mcp: []\n",
+        ctx=make_context(source_session=declared_session()),
+    )
+
+    by_construct = {category.construct: category for category in report.categories}
+    skills = by_construct[ManifestCategory.SKILLS]
+    mcp = by_construct[ManifestCategory.MCP]
+    assert skills.aborted is True
+    assert skills.partially_written is True
+    assert mcp.removals == ()
+    assert _outcomes(report)["mcp.actual"] is EntryOutcome.UPDATED
+    assert "Skill dependency" in (mcp.entries[0].note or "")
+    assert report.status is ApplyStatus.PARTIAL
+
+
+@pytest.mark.asyncio
+async def test_failed_local_asset_cleanup_reports_partial_and_no_removal():
+    uploads = FakeSkillUploadService()
+    reader = FakeCapabilityReader(
+        assets=[], local_assets=[SimpleNamespace(
+            skill_id=71, name="stale-local", git_path="local://stale-local",
+            mcp_dependencies=(),
+        )]
+    )
+
+    async def _fail_delete(**_kwargs):
+        raise RuntimeError("storage unavailable")
+
+    uploads.delete_local_skill = _fail_delete
+    report = await _apply(
+        _engine(uploads=uploads, reader=reader),
+        "schema_version: 1\nmanifest:\n  skills: []\n",
+    )
+
+    category = report.categories[0]
+    assert report.status is ApplyStatus.PARTIAL
+    assert category.partially_written is True
+    assert category.removals == ()
 
 
 @pytest.mark.asyncio
@@ -800,6 +1174,7 @@ async def test_a_fetching_document_applies_all_four_categories_in_order():
             script_service=FakeStartupScriptService(),
             activation_service=activation,
             mcp_auth_service=FakeMcpAuth(),
+            mcp_config_service=object(),
             identity_service=identity,
             upload_service=uploads,
             capability_reader=reader,

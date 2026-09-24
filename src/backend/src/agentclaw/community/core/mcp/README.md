@@ -7,6 +7,7 @@ MCP (Model Context Protocol) domain — config, auth, and sync for MCP servers b
 ```yaml
 purpose: "MCP (Model Context Protocol) domain — config, auth, and sync for MCP servers bound to bots/devices."
 provides:
+  - "EffectiveMCPStateReaderProtocol"
   - "MCPConfigService"
   - "MCPAuthService"
   - "MCPSyncService"
@@ -68,4 +69,20 @@ internal_dependencies:
 
 ### Change impact
 
-MCP config changes propagate to running engines via the sync plugins; misconfiguration here yields broken tool access on bots without a clear error.
+MCP config changes resolve per Bot: explicit `ac_bot_mcp_config` fields override
+the owner's `ac_user_mcp_config`, then Center/default values fill the remainder.
+They propagate to running engines through `DeviceSync`; the same resolver is used
+for restart/whole-artifact composition. Contract changes therefore affect Manifest
+apply, user-config fan-out, every DeviceSync implementation, and OCB's ARCA adapter.
+
+User-default fan-out is best-effort: the persistent `ac_user_mcp_config` row is
+the desired state, and only Bots whose effective MCP state contains the changed
+server are projected. Unrelated Bots receive neither a device probe nor an
+outcome. A selected Bot's resolution, probe, dispatch, or delivery failure is
+returned in `sync_results` and does not roll the row back; `sync_summary`
+reports the affected/synced/offline/failed counts. When a selected Bot lacks the
+MCP at runtime, the result is `RUNTIME_DRIFT` and the Bot is fully reconciled.
+
+A custom Bot URL does not inherit static user/default/managed credentials in the
+server entry. Container-wide mcporter `headerPolicies` remain host-matched runtime
+policy, however; this core module neither emits nor disables them per server.

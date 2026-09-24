@@ -74,6 +74,9 @@ if TYPE_CHECKING:  # pragma: no cover — the registry stays import-light; see b
     from agentclaw.community.core.mcp.mcp_auth_service_protocol import (
         MCPAuthServiceProtocol,
     )
+    from agentclaw.community.core.mcp.mcp_config_service_protocol import (
+        MCPConfigServiceProtocol,
+    )
     from agentclaw.community.core.skill_center.capability_state_contract import (
         BotCapabilityStateReaderProtocol,
     )
@@ -82,6 +85,10 @@ from agentclaw.community.core.bot_config_manifest.apply.outcomes import (
     ApplyConstruct,
     EntryResult,
 )
+
+
+class ConfirmedPartialWriteError(RuntimeError):
+    """A materialiser knows an earlier durable step committed before failure."""
 
 
 @dataclass(frozen=True)
@@ -210,6 +217,9 @@ class PlannedEntry:
     #: the enum: ``"created"``, ``"updated"`` or ``"unchanged"``. Never
     #: ``"failed"`` or ``"skipped"``, which are the orchestrator's to assign.
     outcome: str
+    #: Internal convergence can require a source transition even when the
+    #: public effective state remains unchanged (for example SkillSet → Direct).
+    requires_write: bool = False
 
 
 @dataclass(frozen=True)
@@ -245,6 +255,10 @@ class CategoryPlan:
     #: them, so a report reads deterministically. Reported separately from entry
     #: outcomes because a removal has no declared entry to attach to.
     removals: tuple[str, ...] = field(default=())
+    #: Identities the writer must clean up. Usually identical to ``removals``;
+    #: it is wider when a derived Skill dependency retains an MCP in the final
+    #: runtime closure and therefore must not be reported as removed.
+    removal_writes: tuple[str, ...] | None = None
 
     @property
     def is_noop(self) -> bool:
@@ -254,8 +268,9 @@ class CategoryPlan:
         document must not merely produce equal output, it must make **no
         writes**, and that is observable only if the plan can say so.
         """
-        return not self.removals and all(
-            entry.outcome == "unchanged" for entry in self.entries
+        return not (self.removal_writes if self.removal_writes is not None else self.removals) and all(
+            entry.outcome == "unchanged" and not entry.requires_write
+            for entry in self.entries
         )
 
 
@@ -341,6 +356,7 @@ def build_materialisers(
     script_service: BotStartupScriptServiceProtocol,
     activation_service: ActivationPort,
     mcp_auth_service: MCPAuthServiceProtocol,
+    mcp_config_service: MCPConfigServiceProtocol,
     identity_service: IdentityFilePort,
     upload_service: SkillPackageUploadPort,
     capability_reader: BotCapabilityStateReaderProtocol,
@@ -403,7 +419,12 @@ def build_materialisers(
 
     materialisers: tuple[Materialiser, ...] = (
         ScriptMaterialiser(script_service),
-        McpMaterialiser(activation_service, mcp_auth_service),
+        McpMaterialiser(
+            activation_service,
+            mcp_auth_service,
+            mcp_config_service,
+            capability_reader,
+        ),
         IdentityMaterialiser(identity_service, entry_fetcher),
         SkillsMaterialiser(
             upload_service,
@@ -420,6 +441,7 @@ def build_materialisers(
 
 __all__ = [
     "CategoryPlan",
+    "ConfirmedPartialWriteError",
     "Intent",
     "Materialiser",
     "PlannedEntry",

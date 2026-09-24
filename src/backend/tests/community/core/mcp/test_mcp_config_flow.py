@@ -23,6 +23,7 @@ from agentclaw.community.core.mcp.config_flow import (
 from agentclaw.community.core.mcp.errors import (
     McpConfigValueError,
     McpHeadersInvalidError,
+    McpMarketUnavailableError,
     McpServerNotFoundError,
     McpSyncFailedError,
 )
@@ -32,6 +33,7 @@ def _config_service(*, existing=None):
     m = MagicMock()
     m.get_user_unified_config.return_value = existing
     m.validate_headers_for_mcp.return_value = {"valid": True, "error": None}
+    m.validate_user_config_update.return_value = {"valid": True, "error": None}
     # update returns the *prior* config (None when the row was newly created).
     m.update_user_unified_config.return_value = None
     return m
@@ -124,6 +126,9 @@ def test_write_success_returns_masked_write_shaped_config():
 
 def test_write_forwards_params_for_merge_and_push():
     cfg = _config_service()
+    cfg.validate_user_config_update.return_value = {
+        "valid": True, "error": None, "affected_bot_ids": ["bot-1"]
+    }
     sync = _sync_service()
     _write(cfg=cfg, sync=sync, endpoint_env=None, api_key=None, headers=None)
     # An omitted field is forwarded as None so config_service merges (not replace).
@@ -132,6 +137,7 @@ def test_write_forwards_params_for_merge_and_push():
     # And the same identity/values reach the device push.
     _, sync_kw = sync.sync_mcp_detail_to_all_bots.call_args
     assert sync_kw["entity_id"] == "u1" and sync_kw["entity_type"] == "staff"
+    assert sync_kw["target_bot_ids"] == ["bot-1"]
 
 
 # ── write: ordering — bad server never reaches the DB ───────────────
@@ -160,10 +166,37 @@ def test_invalid_headers_raise_before_any_write():
     cfg.update_user_unified_config.assert_not_called()
 
 
-# ── write: rollback on sync failure ─────────────────────────────────
+def test_bot_override_conflict_raises_before_any_write():
+    cfg = _config_service()
+    cfg.validate_user_config_update.return_value = {
+        "valid": False,
+        "error": "Bot bot-1 在 PRE 环境没有可用的 STREAMABLE_HTTP 端点",
+    }
+
+    with pytest.raises(McpConfigValueError, match="bot-1"):
+        _write(cfg=cfg, endpoint_env="PRE")
+
+    cfg.update_user_unified_config.assert_not_called()
 
 
-def test_sync_failure_rolls_back_update_and_raises():
+def test_center_validation_unavailable_is_not_reported_as_config_conflict():
+    cfg = _config_service()
+    cfg.validate_user_config_update.return_value = {
+        "valid": False,
+        "kind": "center_unavailable",
+        "error": "无法从 MCP Center 完成配置校验",
+    }
+
+    with pytest.raises(McpMarketUnavailableError):
+        _write(cfg=cfg)
+
+    cfg.update_user_unified_config.assert_not_called()
+
+
+# ── write: rollback only on batch-level sync failure ─────────────────
+
+
+def test_batch_sync_failure_rolls_back_update_and_raises():
     # The row existed before this call → update returns the prior config.
     prior = {"api_key": "old", "headers": {}, "endpoint_env": "PROD"}
     cfg = _config_service()
@@ -176,7 +209,7 @@ def test_sync_failure_rolls_back_update_and_raises():
     assert kw["old_config"] == prior
 
 
-def test_sync_failure_after_create_rolls_back_as_delete():
+def test_batch_sync_failure_after_create_rolls_back_as_delete():
     # New row → update returns None → rollback receives None → delete path.
     cfg = _config_service()
     cfg.update_user_unified_config.return_value = None
@@ -187,12 +220,29 @@ def test_sync_failure_after_create_rolls_back_as_delete():
     assert kw["old_config"] is None
 
 
+def test_per_bot_delivery_failures_are_returned_without_rollback():
+    cfg = _config_service()
+    sync = _sync_service(
+        success=True,
+        sync_results=[
+            {
+                "bot_id": "offline-bot",
+                "synced": False,
+                "reason": "设备离线",
+                "error": "No active device for binding=42",
+            }
+        ],
+    )
+
+    result = _write(cfg=cfg, sync=sync)
+
+    assert result.sync_results == sync.sync_mcp_detail_to_all_bots.return_value["sync_results"]
+    cfg.rollback_unified_config.assert_not_called()
+
+
 def test_sync_raising_also_rolls_back_and_raises_sync_failure():
-    # The sync service contracts to return a failure dict, but if the push
-    # raises instead the freshly written row must still be rolled back — a
-    # stored-but-unpushed credential would violate the atomic write-and-push
-    # contract. The exception surfaces as McpSyncFailedError like any other
-    # push failure, so each surface maps it with the row already restored.
+    # Per-Bot errors are returned as outcomes. An exception is therefore a
+    # batch-level service/dependency fault and must roll the row back.
     prior = {"api_key": "old", "headers": {}, "endpoint_env": "PROD"}
     cfg = _config_service()
     cfg.update_user_unified_config.return_value = prior

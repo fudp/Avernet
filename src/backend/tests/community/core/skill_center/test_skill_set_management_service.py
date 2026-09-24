@@ -3014,6 +3014,24 @@ async def test_a_declared_claim_delivers_only_that_code():
     )
 
     assert factory.service.deliveries == [(frozenset({"mcp.weather"}), frozenset())]
+
+
+@pytest.mark.asyncio
+async def test_removing_direct_override_refreshes_when_skill_still_supplies_mcp():
+    factory = _RuntimeFactory()
+    runtime = _scoped_projector(factory=factory)
+
+    await runtime.project(
+        bot_id="bot-1",
+        owner_id="true-owner",
+        scope=ProjectionScope(
+            mcp=True,
+            released_mcp=frozenset({"mcp.weather"}),
+            updated_mcp=frozenset({"mcp.weather"}),
+        ),
+    )
+
+    assert factory.service.deliveries == [(frozenset({"mcp.weather"}), frozenset())]
     # Declaration stays total even though delivery did not.
     assert factory.service.mcp_codes == {
         "mcp.weather",
@@ -4419,6 +4437,23 @@ async def test_an_mcp_only_scope_does_not_touch_the_skill_runtime():
 
 
 @pytest.mark.asyncio
+async def test_an_mcp_config_update_redelivers_only_the_updated_server():
+    factory = _RuntimeFactory()
+    runtime = _scoped_projector(factory=factory)
+
+    await runtime.project(
+        bot_id="bot-1",
+        owner_id="true-owner",
+        scope=ProjectionScope(
+            mcp=True,
+            updated_mcp=frozenset({"mcp.weather"}),
+        ),
+    )
+
+    assert factory.service.deliveries == [(frozenset({"mcp.weather"}), frozenset())]
+
+
+@pytest.mark.asyncio
 async def test_a_skill_only_scope_touches_neither_the_device_mcps_nor_passport():
     """The MCP allow-list and the Passport manifest are both overwrite-style.
 
@@ -4749,7 +4784,7 @@ async def test_default_mcp_exclusion_passes_the_platform_default_policy():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("active", [False, True])
-async def test_ordinary_set_rejects_platform_default_before_mutation(active):
+async def test_ordinary_set_passes_platform_default_codes_to_transaction(active):
     class Repository(_Repository):
         def get_set(self, **kwargs):
             return {"id": "set-1", "is_default": False, "is_active": active}
@@ -4757,13 +4792,13 @@ async def test_ordinary_set_rejects_platform_default_before_mutation(active):
     repository = Repository()
     runtime = _ProjectionCountingRuntime()
     service = _default_wire_service(repository, runtime)
-    with pytest.raises(SkillSetControlPlaneConflictError, match="RESOURCE_MANAGED_BY_PLATFORM_POLICY"):
-        await service.add_mcp(
-            bot_id="bot-1", owner_id="true-owner", user_id="true-owner",
-            set_id="set-1", server_code="mcp.ant.arkai.dimamcpserver",
-        )
-    assert repository.add_mcp_calls == []
-    assert runtime.projections == 0
+    await service.add_mcp(
+        bot_id="bot-1", owner_id="true-owner", user_id="true-owner",
+        set_id="set-1", server_code="mcp.ant.arkai.dimamcpserver",
+    )
+    assert len(repository.add_mcp_calls) == 1
+    assert "mcp.ant.arkai.dimamcpserver" in repository.add_mcp_calls[0]["platform_default_codes"]
+    assert runtime.projections == int(active)
 
 
 @pytest.mark.asyncio

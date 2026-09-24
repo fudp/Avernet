@@ -20,7 +20,7 @@ class DirectActivationServiceProtocol(Protocol):
     by itself, which is teclaw's artifact. The default is the pre-W8 contract.
 
     **This is not the manifest apply engine's ``ActivationPort``.** That port is
-    these six methods *without* ``project``, because choosing whether to project
+    the apply-relevant surface *without* ``project``, because choosing whether to project
     belongs to the delivery strategy rather than to a materialiser. It is not a
     supertype of this Protocol and this service is not bound to it: the two
     wrappers in ``bot_config_manifest/apply/activation_delegates.py`` hold a
@@ -41,9 +41,47 @@ class DirectActivationServiceProtocol(Protocol):
     ) -> dict[str, Any]: ...
 
     @abstractmethod
+    async def claim_manifest_skill(
+        self, *, skill_id: str, bot_id: str, owner_id: str, actor_id: str,
+        apply_id: str | None, project: bool = True,
+    ) -> dict[str, Any]: ...
+
+    @abstractmethod
+    async def remove_manifest_skill(
+        self, *, skill_id: str, bot_id: str, owner_id: str, actor_id: str,
+        apply_id: str | None, remove_inactive_memberships: bool,
+        project: bool = True,
+    ) -> dict[str, Any]: ...
+
+    @abstractmethod
     async def activate_mcp(
         self, *, server_code: str, bot_id: str, owner_id: str, actor_id: str,
         project: bool = True,
+    ) -> dict[str, Any]: ...
+
+    @abstractmethod
+    async def set_mcp_override(
+        self,
+        *,
+        server_code: str,
+        config: dict | None,
+        bot_id: str,
+        owner_id: str,
+        actor_id: str,
+        project: bool = True,
+    ) -> dict[str, Any]: ...
+
+    @abstractmethod
+    async def claim_manifest_mcp(
+        self, *, server_code: str, config: dict | None, bot_id: str,
+        owner_id: str, actor_id: str, apply_id: str | None,
+        project: bool = True,
+    ) -> dict[str, Any]: ...
+
+    @abstractmethod
+    async def remove_manifest_mcp(
+        self, *, server_code: str, bot_id: str, owner_id: str, actor_id: str,
+        apply_id: str | None, project: bool = True,
     ) -> dict[str, Any]: ...
 
     @abstractmethod
@@ -59,6 +97,27 @@ class DirectActivationServiceProtocol(Protocol):
         """The Bot's active MCP server codes — the query twin of the commands
         above, answered by the capability state reader (which flushes first)."""
         ...
+
+    @abstractmethod
+    def get_mcp_overrides(
+        self, *, bot_id: str, owner_id: str, actor_id: str
+    ) -> dict[str, dict]: ...
+
+    @abstractmethod
+    def manifest_direct_mcp_codes(
+        self, *, bot_id: str, owner_id: str, actor_id: str,
+        server_codes: set[str],
+    ) -> set[str]: ...
+
+    @abstractmethod
+    def set_managed_mcp_codes(
+        self,
+        *,
+        bot_id: str,
+        owner_id: str,
+        actor_id: str,
+        server_codes: set[str],
+    ) -> set[str]: ...
 
     @abstractmethod
     def platform_default_mcp_codes(
