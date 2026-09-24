@@ -17,9 +17,10 @@
 | LOCAL_K8S_CPU_LIMIT | 1 | 否 | CPU limit |
 | LOCAL_K8S_MEMORY_REQUEST | 1Gi | 否 | 内存 request |
 | LOCAL_K8S_MEMORY_LIMIT | 2Gi | 否 | 内存 limit |
-| LOCAL_K8S_IMAGE_PULL_POLICY | IfNotPresent | 否 | 镜像拉取策略 |
+| LOCAL_K8S_IMAGE_PULL_POLICY | - | 否 | 显式镜像拉取策略；未设置时，镜像 tag 为 ``latest`` 或为空则默认 ``Always``，否则默认 ``IfNotPresent`` |
 | LOCAL_K8S_NODE_PORT | - | 否 | 固定 NodePort；不填则由 K8s 自动分配 |
 | LOCAL_K8S_EXTRA_ENVS | - | 否 | JSON 对象，注入到 Pod 容器的环境变量（可被 envs 入参覆盖） |
+| LOCAL_K8S_SIDECAR_IMAGE | avernet-engine-sidecar:latest | 否 | engine sidecar 镜像 |
 
 colima + k3s 最小示例（NodePort，无需额外映射端口）：
 ::
@@ -66,8 +67,13 @@ _DEFAULT_CPU_LIMIT = "1"
 _DEFAULT_MEMORY_REQUEST = "1Gi"
 _DEFAULT_MEMORY_LIMIT = "2Gi"
 
-_DEFAULT_IMAGE = "local-k8s-openclaw:latest"
+_DEFAULT_IMAGE = "avernet-engine:latest"
+_DEFAULT_SIDECAR_IMAGE = "avernet-engine-sidecar:latest"
 _DEFAULT_CONTEXT = "colima"
+
+_SIDECAR_CONTAINER_NAME = "envoy-sidecar"
+_SIDECAR_PROXY_PORT = 38080
+_SIDECAR_ADMIN_PORT = 38081
 
 # Environment variable names consumed by this plugin.
 ENV_KUBECONFIG = "LOCAL_K8S_KUBECONFIG"
@@ -75,6 +81,7 @@ _ENV_FALLBACK_KUBECONFIG_PATH = "KUBECONFIG"
 ENV_CONTEXT = "LOCAL_K8S_CONTEXT"
 ENV_NAMESPACE = "LOCAL_K8S_NAMESPACE"
 ENV_IMAGE = "LOCAL_K8S_IMAGE"
+ENV_SIDECAR_IMAGE = "LOCAL_K8S_SIDECAR_IMAGE"
 ENV_CONTAINER_PORT = "LOCAL_K8S_CONTAINER_PORT"
 ENV_CPU_REQUEST = "LOCAL_K8S_CPU_REQUEST"
 ENV_CPU_LIMIT = "LOCAL_K8S_CPU_LIMIT"
@@ -130,6 +137,17 @@ def _resolve_image(image_override: str | None) -> str:
     return image
 
 
+def _resolve_sidecar_image(image_override: str | None = None) -> str:
+    """Sidecar 镜像优先级：显式参数 > LOCAL_K8S_SIDECAR_IMAGE 环境变量 > 内置默认值。"""
+    image = image_override or _env(ENV_SIDECAR_IMAGE, _DEFAULT_SIDECAR_IMAGE)
+    if not image:
+        raise ValueError(
+            "local_k8s plugin requires a sidecar image. "
+            "Provide it via config or set LOCAL_K8S_SIDECAR_IMAGE."
+        )
+    return image
+
+
 def _resolve_kubeconfig() -> str:
     """读取 kubeconfig 内容：LOCAL_K8S_KUBECONFIG > KUBECONFIG > ~/.kube/config。"""
     path = _env(ENV_KUBECONFIG) or _env(_ENV_FALLBACK_KUBECONFIG_PATH)
@@ -162,8 +180,38 @@ def _container_port() -> int:
     )
 
 
-def _image_pull_policy() -> str:
-    return _env(ENV_IMAGE_PULL_POLICY, "IfNotPresent")
+def _image_pull_policy(image: str) -> str:
+    """根据用户显式配置和镜像 tag 决定 imagePullPolicy。
+
+    优先级：
+    1. ``LOCAL_K8S_IMAGE_PULL_POLICY`` 环境变量显式设置时，直接采用。
+    2. 镜像 tag 为 ``latest`` 或镜像未指定 tag 时，使用 ``Always``，
+       避免 K8s 复用本地过期的 ``latest`` 镜像。
+    3. 其它明确 tag 使用 ``IfNotPresent``，减少重复拉取。
+    """
+    env_policy = _env(ENV_IMAGE_PULL_POLICY)
+    if env_policy:
+        return env_policy
+    tag = _extract_image_tag(image)
+    if not tag or tag == "latest":
+        return "Always"
+    return "IfNotPresent"
+
+
+def _extract_image_tag(image: str) -> str:
+    """从容器镜像引用中提取 tag（不含 digest 部分）。
+
+    支持 ``registry:port/namespace/image:tag`` 形式，正确区分_registry_端口和 tag。
+    """
+    # Strip digest if present; tag precedes '@'.
+    name_part = image.split("@", 1)[0]
+    # Tag is the last ':' after the last '/'.
+    last_slash = name_part.rfind("/")
+    name_and_tag = name_part[last_slash + 1 :]
+    if ":" in name_and_tag:
+        _, tag = name_and_tag.rsplit(":", 1)
+        return tag
+    return ""
 
 
 def _node_port() -> int | None:
@@ -191,6 +239,37 @@ def _resolve_extra_envs() -> dict[str, str]:
             f"got {type(parsed).__name__}"
         )
     return {str(k): str(v) for k, v in parsed.items()}
+
+
+def _convert_outbound_rules(rule: OutBoundOperationRule | None) -> str:
+    """把 OutBoundOperationRule 转成 envoy sidecar 所需的 header-rules.yaml 文本。"""
+    if not rule or not rule.header_operation_rules:
+        return "rules: []"
+
+    domain_groups: dict[tuple[str, ...], dict[str, Any]] = {}
+    for h in rule.header_operation_rules:
+        key = tuple(sorted(h.domains))
+        if key not in domain_groups:
+            domain_groups[key] = {
+                "name": h.domains[0],
+                "domains": list(h.domains),
+                "set": [],
+                "remove": [],
+            }
+        action = (h.action or "").lower()
+        if action in ("replace", "set"):
+            set_entry: dict[str, Any] = {"header": h.header_name, "value": h.value}
+            if h.placeholder:
+                set_entry["placeholder"] = h.placeholder
+            domain_groups[key]["set"].append(set_entry)
+        elif action == "remove":
+            domain_groups[key]["remove"].append(h.header_name)
+
+    return yaml.safe_dump(
+        {"rules": list(domain_groups.values())},
+        default_flow_style=False,
+        sort_keys=False,
+    )
 
 
 def _build_resources(
@@ -285,18 +364,47 @@ class LocalK8sArcaSandboxPlugin(ArcaSandboxPlugin):
     def _client(self) -> ApiClient:
         return self._client_manager.get_client(_resolve_kubeconfig(), _context())
 
+    def _create_header_rules_configmap(
+        self,
+        deployment_name: str,
+        outbound_operation_rule: OutBoundOperationRule | None,
+    ) -> str:
+        """创建 header-rules ConfigMap，返回 ConfigMap 名称。"""
+        from kubernetes.client import CoreV1Api, V1ConfigMap, V1ObjectMeta
+
+        namespace = _namespace()
+        configmap_name = f"envoy-header-rules-{deployment_name}"
+        configmap = V1ConfigMap(
+            api_version="v1",
+            kind="ConfigMap",
+            metadata=V1ObjectMeta(name=configmap_name, namespace=namespace),
+            data={"header-rules.yaml": _convert_outbound_rules(outbound_operation_rule)},
+        )
+        core_api = CoreV1Api(self._client())
+        core_api.create_namespaced_config_map(
+            namespace=namespace, body=configmap
+        )
+        logger.info(
+            "local_k8s: created configmap %s/%s", namespace, configmap_name
+        )
+        return configmap_name
+
     def _create_deployment(
         self,
         deployment_name: str,
         template_id: str,
         image: str,
+        sidecar_image: str,
         container_port: int,
         envs: dict[str, str] | None,
         resource_spec: ResourceSpecification | None,
+        configmap_name: str,
     ) -> None:
-        """创建 Deployment。"""
+        """创建包含 bot-runtime 与 envoy-sidecar 的双容器 Deployment。"""
         from kubernetes.client import (
             AppsV1Api,
+            V1Capabilities,
+            V1ConfigMapVolumeSource,
             V1Container,
             V1Deployment,
             V1DeploymentSpec,
@@ -305,6 +413,9 @@ class LocalK8sArcaSandboxPlugin(ArcaSandboxPlugin):
             V1PodSpec,
             V1PodTemplateSpec,
             V1ResourceRequirements,
+            V1SecurityContext,
+            V1Volume,
+            V1VolumeMount,
         )
 
         namespace = _namespace()
@@ -321,12 +432,37 @@ class LocalK8sArcaSandboxPlugin(ArcaSandboxPlugin):
         container = V1Container(
             name=self.CONTAINER_NAME,
             image=image,
-            image_pull_policy=_image_pull_policy(),
+            image_pull_policy=_image_pull_policy(image),
             ports=[{"containerPort": container_port}],  # type: ignore[arg-type]
             env=_env_list_from_dict(envs),
             resources=V1ResourceRequirements(
                 requests={"cpu": cpu_request, "memory": memory_request},
                 limits={"cpu": cpu_limit, "memory": memory_limit},
+            ),
+        )
+
+        sidecar = V1Container(
+            name=_SIDECAR_CONTAINER_NAME,
+            image=sidecar_image,
+            image_pull_policy=_image_pull_policy(sidecar_image),
+            ports=[
+                {"containerPort": _SIDECAR_PROXY_PORT},  # type: ignore[arg-type]
+                {"containerPort": _SIDECAR_ADMIN_PORT},  # type: ignore[arg-type]
+            ],
+            volume_mounts=[
+                V1VolumeMount(
+                    name="header-rules",
+                    mount_path="/etc/sidecar/header-rules.yaml",
+                    sub_path="header-rules.yaml",
+                    read_only=True,
+                )
+            ],
+            resources=V1ResourceRequirements(
+                requests={"cpu": "50m", "memory": "64Mi"},
+                limits={"cpu": "200m", "memory": "256Mi"},
+            ),
+            security_context=V1SecurityContext(
+                capabilities=V1Capabilities(add=["NET_ADMIN"])
             ),
         )
 
@@ -339,7 +475,17 @@ class LocalK8sArcaSandboxPlugin(ArcaSandboxPlugin):
                 selector=V1LabelSelector(match_labels={"app": deployment_name}),
                 template=V1PodTemplateSpec(
                     metadata=V1ObjectMeta(labels=labels),
-                    spec=V1PodSpec(containers=[container]),
+                    spec=V1PodSpec(
+                        containers=[container, sidecar],
+                        volumes=[
+                            V1Volume(
+                                name="header-rules",
+                                config_map=V1ConfigMapVolumeSource(
+                                    name=configmap_name
+                                ),
+                            )
+                        ],
+                    ),
                 ),
             ),
         )
@@ -465,6 +611,7 @@ class LocalK8sArcaSandboxPlugin(ArcaSandboxPlugin):
         deployment_name = _build_deployment_name(template_id)
         container_port = _container_port()
         resolved_image = _resolve_image(image)
+        resolved_sidecar_image = _resolve_sidecar_image()
 
         # 合并环境变量。优先级：调用方 envs > LOCAL_K8S_EXTRA_ENVS > metadata 默认值
         merged_envs = _resolve_extra_envs()
@@ -472,13 +619,19 @@ class LocalK8sArcaSandboxPlugin(ArcaSandboxPlugin):
         if metadata:
             merged_envs.setdefault("BOT_ID", metadata.get("bot_id", ""))
 
+        configmap_name = self._create_header_rules_configmap(
+            deployment_name=deployment_name,
+            outbound_operation_rule=outbound_operation_rule,
+        )
         self._create_deployment(
             deployment_name=deployment_name,
             template_id=template_id,
             image=resolved_image,
+            sidecar_image=resolved_sidecar_image,
             container_port=container_port,
             envs=merged_envs,
             resource_spec=resource_spec,
+            configmap_name=configmap_name,
         )
         self._create_service(deployment_name, container_port)
         pod_name = self._wait_for_pod(deployment_name, ready_timeout_in_seconds)
@@ -493,6 +646,7 @@ class LocalK8sArcaSandboxPlugin(ArcaSandboxPlugin):
             credentials=self._credentials,
             ttl_in_minutes=ttl_in_minutes,
             resources=resource_spec,
+            sidecar_container_name=_SIDECAR_CONTAINER_NAME,
         )
 
     def connect_sync_sandbox(self, sandbox_id: str) -> ArcaSandbox:
