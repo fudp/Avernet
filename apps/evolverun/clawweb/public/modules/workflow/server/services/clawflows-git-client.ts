@@ -91,6 +91,17 @@ function getHostFromRemoteUrl(remoteUrl: string): string {
   return hostMatch?.[1] ?? "";
 }
 
+function getAuthenticatedRemoteUrl(
+  remoteUrl: string,
+  username: string,
+  token: string | undefined,
+): string {
+  if (!token) return remoteUrl;
+  const encodedUsername = encodeURIComponent(username || "");
+  const encodedToken = encodeURIComponent(token);
+  return remoteUrl.replace(/^https:\/\//, `https://${encodedUsername}:${encodedToken}@`);
+}
+
 async function configureGitCredential(
   repoDir: string,
   remoteUrl: string,
@@ -100,18 +111,19 @@ async function configureGitCredential(
   const host = getHostFromRemoteUrl(remoteUrl);
   if (!host || !token) return;
 
-  git(repoDir, ["config", "credential.helper", "cache --timeout 86400"]);
-  execFileSync(
-    "git",
-    ["credential", "approve"],
-    {
-      cwd: repoDir,
-      input: `protocol=https\nhost=${host}\nusername=${username}\npassword=${token}\n`,
-      encoding: "utf-8",
-      timeout: 5_000,
-      env: isolatedGitEnvironment(process.env),
-    },
+  // Use a credentials file stored inside the temporary repo directory so that
+  // subsequent git operations (fetch/push) can authenticate without keeping the
+  // token in the remote URL. The whole repoDir is removed once auto-heal finishes.
+  const credentialsPath = path.join(repoDir, ".git", "credentials");
+  const encodedUsername = encodeURIComponent(username || "");
+  const encodedToken = encodeURIComponent(token);
+  await writeFile(
+    credentialsPath,
+    `https://${encodedUsername}:${encodedToken}@${host}\n`,
+    { mode: 0o600 },
   );
+
+  git(repoDir, ["config", "credential.helper", `store --file ${credentialsPath}`]);
 }
 
 function getTempRepoPrefix(): string {
@@ -143,19 +155,24 @@ export async function cloneClawflows(
 ): Promise<void> {
   if (!config.remoteUrl) throw new Error("clawflowsRemoteUrl is not configured");
 
-  // Configure credentials before cloning so that the clone operation can
-  // authenticate against the remote (e.g. code.alipay.com).
-  if (config.token) {
-    await configureGitCredential(repoDir, config.remoteUrl, config.username, config.token);
-  }
+  const cloneUrl = getAuthenticatedRemoteUrl(config.remoteUrl, config.username, config.token);
 
-  git(repoDir, ["clone", "--quiet", config.remoteUrl, "."], {
+  git(repoDir, ["clone", "--quiet", cloneUrl, "."], {
     env: isolatedGitEnvironment(process.env),
     timeout: 120_000,
   });
 
+  // Prevent the token from being persisted in the local repo's remote URL.
+  git(repoDir, ["remote", "set-url", "origin", config.remoteUrl]);
+
   git(repoDir, ["config", "user.name", config.username || "clawweb"]);
   git(repoDir, ["config", "user.email", config.email || `${config.username || "clawweb"}@antgroup.com`]);
+
+  // Keep credential helper as a fallback for subsequent git operations
+  // (e.g. fetch/push) in case they are needed.
+  if (config.token) {
+    await configureGitCredential(repoDir, config.remoteUrl, config.username, config.token);
+  }
 }
 
 function specPath(repoDir: string, packId: string, workflowId: string): string {
