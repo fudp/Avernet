@@ -95,7 +95,7 @@ describe('editor save (DB + git snapshot) and server-side deploy', () => {
   it('saves to the DB first, then snapshots to git and reports the saved branch and commit', async () => {
     renderEditor()
     await userEvent.click(screen.getByRole('button', { name: '保存' }))
-    await userEvent.click(screen.getByRole('button', { name: 'Save to Database' }))
+    await userEvent.click(screen.getByRole('button', { name: '保存工作流' }))
     await waitFor(() => expect(mocks.gitSave).toHaveBeenCalledTimes(1))
     expect(mocks.saveDb).toHaveBeenCalledWith(
       expect.objectContaining({ workflowId: 'wf-1', skipDeployHistory: true, botOwnerId: 'user-1' }),
@@ -111,7 +111,7 @@ describe('editor save (DB + git snapshot) and server-side deploy', () => {
     mocks.gitSave.mockRejectedValue(new Error('git push failed'))
     renderEditor()
     await userEvent.click(screen.getByRole('button', { name: '保存' }))
-    await userEvent.click(screen.getByRole('button', { name: 'Save to Database' }))
+    await userEvent.click(screen.getByRole('button', { name: '保存工作流' }))
     expect(await screen.findByText(/数据库已保存，但 git 快照失败：git push failed/)).toBeInTheDocument()
     expect(mocks.saveDb).toHaveBeenCalledTimes(1)
     expect(mocks.markClean).toHaveBeenCalled()
@@ -130,6 +130,9 @@ describe('editor save (DB + git snapshot) and server-side deploy', () => {
     renderEditor()
     await userEvent.click(screen.getByRole('button', { name: '部署' }))
     expect(screen.getByText(/该工作流尚无线上生效版本/)).toBeInTheDocument()
+    // The fallback hint splits across <p> and <code> elements — assert both parts.
+    expect(screen.getByText(/Bot 命令兜底：在 Bot 对话执行/)).toBeInTheDocument()
+    expect(screen.getByText('/workflow deploy wf-1')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: '确认部署' }))
     await waitFor(() =>
       expect(mocks.deploy).toHaveBeenCalledWith({ workflowId: 'wf-1', note: 'editor deploy', autoRun: false }),
@@ -159,6 +162,23 @@ describe('editor save (DB + git snapshot) and server-side deploy', () => {
     await screen.findByText('与生效 v2 有差异 · 待部署')
     await userEvent.click(screen.getByRole('button', { name: '部署' }))
     expect(screen.getByText('部署前差异')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: '确认部署' }))
+    await waitFor(() =>
+      expect(mocks.deploy).toHaveBeenCalledWith({ workflowId: 'wf-1', note: 'editor deploy', autoRun: false }),
+    )
+  })
+
+  it('warns about a missing snapshot when a deploy record exists and still deploys after confirm', async () => {
+    mocks.getHistory.mockResolvedValue({
+      active: { workflowId: 'wf-1', deployNumber: 3, version: 2, action: 'deploy' },
+      history: [],
+    })
+    mocks.getDeploySnapshot.mockRejectedValue(new Error('boom'))
+    renderEditor()
+    // Wait for the baseline chip so latestDeploy is set before opening the confirm dialog.
+    await screen.findByText(/生效 v2 · deploy #3/)
+    await userEvent.click(screen.getByRole('button', { name: '部署' }))
+    expect(await screen.findByText(/无法获取线上生效版本的快照/)).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: '确认部署' }))
     await waitFor(() =>
       expect(mocks.deploy).toHaveBeenCalledWith({ workflowId: 'wf-1', note: 'editor deploy', autoRun: false }),

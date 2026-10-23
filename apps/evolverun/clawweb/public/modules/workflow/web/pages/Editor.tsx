@@ -17,6 +17,19 @@ import type { WorkflowSpec, DeployHistoryItem, VersionSnapshot, AutoHealSaveResu
 
 type ViewMode = 'visual' | 'yaml' | 'split'
 
+/** Extract a human-readable message from fetchJson ApiError strings ("API NNN: {json}"). */
+function extractApiErrorMessage(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err)
+  const jsonMatch = msg.match(/^API \d+:\s*(\{.*\})$/s)
+  if (jsonMatch) {
+    try {
+      const parsed = JSON.parse(jsonMatch[1]) as { message?: string }
+      if (parsed.message) return parsed.message
+    } catch { /* not valid JSON — fall through */ }
+  }
+  return msg
+}
+
 interface EditorProps {
   /** Embedded inside another page (e.g. 任务护航 workspace): hides the workflow sidebar and fills parent height. */
   embedded?: boolean
@@ -207,7 +220,7 @@ export default function Editor({ embedded = false, initialWorkflowId }: EditorPr
       try {
         gitResult = await gitSaveMutation.mutateAsync({ workflowId: id, spec: specToSave, note: 'editor save' })
       } catch (gitErr) {
-        gitError = gitErr instanceof Error ? gitErr.message : String(gitErr)
+        gitError = extractApiErrorMessage(gitErr)
       }
       if (id !== spec.id || title !== spec.title) {
         useEditorStore.getState().updateSpecField('id', id)
@@ -219,11 +232,12 @@ export default function Editor({ embedded = false, initialWorkflowId }: EditorPr
       if (gitResult) {
         const shortCommit = gitResult.commit ? gitResult.commit.slice(0, 8) : ''
         setSaveMessage({ type: 'success', text: `工作流已保存（git ${gitResult.branch}${shortCommit ? ` · ${shortCommit}` : ''}）` })
+        setTimeout(() => setSaveMessage(null), 3000)
       } else {
-        // Degraded: DB saved, git snapshot failed. Save is idempotent — retry recovers.
+        // Degraded: DB saved, git snapshot failed. Keep the warning visible (no
+        // auto-dismiss) like other error paths; save is idempotent — retry recovers.
         setSaveMessage({ type: 'error', text: `数据库已保存，但 git 快照失败：${gitError}。重试保存可恢复。` })
       }
-      setTimeout(() => setSaveMessage(null), 3000)
     } catch (err) {
       setSaveMessage({ type: 'error', text: err instanceof Error ? err.message : '保存失败' })
     }
@@ -319,7 +333,7 @@ export default function Editor({ embedded = false, initialWorkflowId }: EditorPr
       // Refresh the comparison baseline so the「待部署」badge clears immediately.
       setDeploymentBaselineRevision((revision) => revision + 1)
     } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err)
+      const detail = extractApiErrorMessage(err)
       setSaveMessage({ type: 'error', text: `部署失败：${detail}。兜底：在 Bot 对话执行 /workflow deploy ${selectedWorkflowId}` })
     } finally {
       deployInFlight.current = false
@@ -663,7 +677,7 @@ export default function Editor({ embedded = false, initialWorkflowId }: EditorPr
                 disabled={!saveId.trim() || !!commandError || saveToDbMutation.isPending || gitSaveMutation.isPending}
                 className="rounded-md bg-blue-600 px-4 py-1.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-40"
               >
-                {saveToDbMutation.isPending || gitSaveMutation.isPending ? '保存中…' : 'Save to Database'}
+                {saveToDbMutation.isPending || gitSaveMutation.isPending ? '保存中…' : '保存工作流'}
               </button>
             </div>
           </div>
@@ -710,9 +724,12 @@ export default function Editor({ embedded = false, initialWorkflowId }: EditorPr
                 )
               })}
             </div>
-            <div className="flex justify-end gap-2 border-t border-gray-200 bg-gray-50 px-4 py-2">
-              <button onClick={() => setShowDeploymentDiff(false)} className="rounded border border-gray-300 bg-white px-3 py-1 text-xs text-gray-700 hover:bg-gray-50">稍后部署</button>
-              <button onClick={() => { setShowDeploymentDiff(false); void runDeploy() }} className="rounded bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-700">确认部署</button>
+            <div className="flex items-center justify-between gap-2 border-t border-gray-200 bg-gray-50 px-4 py-2">
+              <span className="truncate text-xs text-gray-400">Bot 命令兜底：<code className="rounded bg-gray-100 px-1">/workflow deploy {selectedWorkflowId}</code></span>
+              <span className="flex shrink-0 gap-2">
+                <button onClick={() => setShowDeploymentDiff(false)} className="rounded border border-gray-300 bg-white px-3 py-1 text-xs text-gray-700 hover:bg-gray-50">稍后部署</button>
+                <button onClick={() => { setShowDeploymentDiff(false); void runDeploy() }} className="rounded bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-700">确认部署</button>
+              </span>
             </div>
           </div>
         </div>
@@ -726,7 +743,12 @@ export default function Editor({ embedded = false, initialWorkflowId }: EditorPr
             <p className="mt-3 text-sm text-gray-600">
               {activeSnapshot
                 ? '当前内容与线上生效版本一致，仍要重新部署吗？将生成新的部署记录（deploy #、git tag）。'
-                : '该工作流尚无线上生效版本，部署后将创建首个生效版本。'}
+                : latestDeploy
+                  ? '无法获取线上生效版本的快照，仍要部署当前已保存内容吗？'
+                  : '该工作流尚无线上生效版本，部署后将创建首个生效版本。'}
+            </p>
+            <p className="mt-2 text-xs text-gray-400">
+              Bot 命令兜底：在 Bot 对话执行 <code className="rounded bg-gray-100 px-1">/workflow deploy {selectedWorkflowId}</code>
             </p>
             <div className="mt-5 flex justify-end gap-2">
               <button onClick={() => setShowDeployConfirm(false)} className="rounded-md border border-gray-300 px-4 py-1.5 text-sm text-gray-700 hover:bg-gray-50">取消</button>
